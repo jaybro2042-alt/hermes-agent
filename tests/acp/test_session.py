@@ -241,6 +241,24 @@ class TestPersistence:
         # Should not be found via ACP SessionManager.
         assert manager.get_session("cli-session-123") is None
 
+    def test_create_session_does_not_persist_empty_row(self, manager):
+        """session/new without a prompt must not leave a ghost source=acp row.
+
+        ACP clients (Open Design model discovery) call session/new purely to
+        read capabilities; the DB row is only created once history exists.
+        """
+        state = manager.create_session()
+        db = manager._get_db()
+        assert db.get_session(state.session_id) is None
+        assert manager.list_sessions() == []
+
+        state.history.append({"role": "user", "content": "hello"})
+        manager.save_session(state.session_id)
+        row = db.get_session(state.session_id)
+        assert row is not None
+        assert row["source"] == "acp"
+        assert len(db.get_messages_as_conversation(state.session_id)) == 1
+
     def test_sessions_searchable_via_fts(self, manager):
         """ACP sessions stored in SessionDB are searchable via FTS5."""
         state = manager.create_session()

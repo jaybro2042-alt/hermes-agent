@@ -436,6 +436,19 @@ class SessionManager:
         try:
             # Ensure the session record exists.
             existing = db.get_session(state.session_id)
+            if existing is None and not state.history:
+                # Defer row creation until the session carries a message.
+                # ACP clients (e.g. the Open Design daemon's model discovery)
+                # routinely call session/new purely to read capabilities and
+                # never send a prompt; persisting here would leave an empty
+                # source=acp "ghost" row per probe. The AIAgent creates the
+                # row itself on the first run_conversation(), and save_session()
+                # after a prompt lands here with history populated.
+                logger.debug(
+                    "Skipping persist of empty ACP session %s (no messages yet)",
+                    state.session_id,
+                )
+                return
             if existing is None:
                 db.create_session(
                     session_id=state.session_id,
