@@ -26,17 +26,23 @@ TitleCallback = Callable[[str], None]
 RuntimeValidator = Callable[[], bool]
 
 _TITLE_PROMPT = (
-    "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
-    "following exchange. The title should capture the main topic or intent. "
-    "Write the title in the same language the user is writing in. "
-    "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
+    "Title this conversation. If a Linear issue ID such as PROD-145, GROW-2, RES-18, or "
+    "OPS-51 appears in the exchange, the title is that ID alone (e.g. 'RES-18'); if several "
+    "appear, use the first. Otherwise the title is 2-4 plain words naming the concrete thing "
+    "being worked on (e.g. 'Slack signup spam', 'Judge calibration'). No prefixes such as "
+    "Jay, Director, cron; no separators; no generic words like greeting, request, session, "
+    "status, memory. If the user resumes a Liminality handoff whose subject is included in "
+    "the exchange, use that subject verbatim. Write in the user's language. Return ONLY the title."
 )
 
 _TITLE_PROMPT_PINNED_LANGUAGE = (
-    "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
-    "following exchange. The title should capture the main topic or intent. "
-    "Write the title in {language}. "
-    "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
+    "Title this conversation. If a Linear issue ID such as PROD-145, GROW-2, RES-18, or "
+    "OPS-51 appears in the exchange, the title is that ID alone (e.g. 'RES-18'); if several "
+    "appear, use the first. Otherwise the title is 2-4 plain words naming the concrete thing "
+    "being worked on (e.g. 'Slack signup spam', 'Judge calibration'). No prefixes such as "
+    "Jay, Director, cron; no separators; no generic words like greeting, request, session, "
+    "status, memory. If the user resumes a Liminality handoff whose subject is included in "
+    "the exchange, use that subject verbatim. Write in {language}. Return ONLY the title."
 )
 
 
