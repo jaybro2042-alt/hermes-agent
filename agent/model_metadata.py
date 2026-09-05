@@ -1013,8 +1013,10 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
         "prompt": ("prompt", "input", "input_cost_per_token", "prompt_token_cost"),
         "completion": ("completion", "output", "output_cost_per_token", "completion_token_cost"),
         "request": ("request", "request_cost"),
-        "cache_read": ("cache_read", "cached_prompt", "input_cache_read", "cache_read_cost_per_token"),
-        "cache_write": ("cache_write", "cache_creation", "input_cache_write", "cache_write_cost_per_token"),
+        # LiteLLM proxies (``/model/info``) publish cache pricing as
+        # ``cache_read_input_token_cost`` / ``cache_creation_input_token_cost``.
+        "cache_read": ("cache_read", "cached_prompt", "input_cache_read", "cache_read_cost_per_token", "cache_read_input_token_cost"),
+        "cache_write": ("cache_write", "cache_creation", "input_cache_write", "cache_write_cost_per_token", "cache_creation_input_token_cost"),
     }
     for mapping in _iter_nested_dicts(payload):
         normalized = {str(key).lower(): value for key, value in mapping.items()}
@@ -1231,6 +1233,8 @@ def fetch_endpoint_model_metadata(
                 except Exception:
                     pass
 
+            _enrich_from_litellm_model_info(candidate, cache, headers)
+
             _endpoint_model_metadata_cache[normalized] = cache
             _endpoint_model_metadata_cache_time[normalized] = time.time()
             return cache
@@ -1242,6 +1246,94 @@ def fetch_endpoint_model_metadata(
     _endpoint_model_metadata_cache[normalized] = {}
     _endpoint_model_metadata_cache_time[normalized] = time.time()
     return {}
+
+
+def _enrich_from_litellm_model_info(
+    candidate: str,
+    cache: Dict[str, Dict[str, Any]],
+    headers: Dict[str, str],
+) -> None:
+    """Fill in per-alias pricing from a LiteLLM proxy's ``/model/info``.
+
+    A LiteLLM proxy's OpenAI-compatible ``/v1/models`` lists only bare alias
+    ids (``{"id": "bedrock-fable-5-1", "owned_by": "openai"}``) with no
+    pricing, so every session routed through such a proxy priced as
+    ``unknown`` and ``estimated_cost_usd`` stayed NULL in state.db.  The
+    proxy does publish per-token pricing under ``/model/info``
+    (``model_info.input_cost_per_token`` etc.), and LiteLLM's own cost
+    tracker is what the bridge bills against, so it is the honest source for
+    the alias.  Best-effort: any failure (non-LiteLLM server, 404, auth)
+    leaves ``cache`` untouched.
+    """
+    if not cache:
+        return
+    root = candidate.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3].rstrip("/")
+    if not root:
+        return
+    try:
+        response = requests.get(
+            root + "/model/info",
+            headers=headers,
+            timeout=(5, 10),
+            verify=_resolve_requests_verify(),
+        )
+        if not response.ok:
+            return
+        payload = response.json()
+    except Exception as exc:  # pragma: no cover - network best effort
+        logger.debug("LiteLLM /model/info probe failed for %s: %s", root, exc)
+        return
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        alias = row.get("model_name")
+        if not isinstance(alias, str) or alias not in cache:
+            continue
+        model_info = row.get("model_info")
+        if not isinstance(model_info, dict):
+            continue
+        entry = cache[alias]
+        litellm_params = row.get("litellm_params")
+        if isinstance(litellm_params, dict):
+            upstream = litellm_params.get("model")
+            if isinstance(upstream, str) and upstream:
+                entry.setdefault("upstream_model", upstream)
+            api_base = litellm_params.get("api_base")
+            if isinstance(api_base, str) and api_base:
+                entry.setdefault("upstream_api_base", api_base)
+        if entry.get("pricing"):
+            continue
+        # An operator who writes ``input_cost_per_token: 0`` into the route's
+        # litellm_params is declaring the route free (e.g. a local GPU model);
+        # honor that.  A zero that only appears in model_info means LiteLLM
+        # has no rate card for the upstream, which must stay "unknown" —
+        # recording it as $0 would silently mark paid traffic as free.
+        operator_declared = isinstance(litellm_params, dict) and any(
+            k in litellm_params for k in ("input_cost_per_token", "output_cost_per_token")
+        )
+        pricing = _extract_pricing({"model_info": model_info})
+        if pricing and (
+            operator_declared
+            or any(
+                _to_float_or_none(pricing.get(k)) not in (None, 0.0)
+                for k in ("prompt", "completion")
+            )
+        ):
+            entry["pricing"] = pricing
+
+
+def _to_float_or_none(value: Any) -> Optional[float]:
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _resolve_endpoint_context_length(

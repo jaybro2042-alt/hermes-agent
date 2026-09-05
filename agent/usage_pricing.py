@@ -745,6 +745,37 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://aws.amazon.com/bedrock/pricing/",
         pricing_version="bedrock-pricing-2026-04",
     ),
+    # OpenAI GPT-5.6 on Bedrock (Mantle / Responses API). Per the AWS model
+    # cards, In-Region + Geo CRIS us-east-1 pricing, Standard tier, short
+    # context window (<=272K). Long-context (>272K) requests bill at 2x and
+    # are not modelled here. Cache write is the 30m tier; Bedrock publishes
+    # no separate 1h write rate for these models.
+    # Source: https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-56-sol.html
+    (
+        "bedrock",
+        "openai.gpt-5-6-sol",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("4.40"),
+        output_cost_per_million=Decimal("22.00"),
+        cache_read_cost_per_million=Decimal("0.44"),
+        cache_write_cost_per_million=Decimal("5.50"),
+        source="official_docs_snapshot",
+        source_url="https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-56-sol.html",
+        pricing_version="bedrock-openai-model-card-2026-09",
+    ),
+    # Source: https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-56-terra.html
+    (
+        "bedrock",
+        "openai.gpt-5-6-terra",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.20"),
+        output_cost_per_million=Decimal("13.20"),
+        cache_read_cost_per_million=Decimal("0.22"),
+        cache_write_cost_per_million=Decimal("2.75"),
+        source="official_docs_snapshot",
+        source_url="https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-56-terra.html",
+        pricing_version="bedrock-openai-model-card-2026-09",
+    ),
     # MiniMax
     (
         "minimax",
@@ -1191,15 +1222,66 @@ def get_pricing_entry(
     if route.provider == "openrouter":
         return _openrouter_pricing_entry(route)
     if route.base_url:
+        endpoint_metadata = fetch_endpoint_model_metadata(route.base_url, api_key=api_key or "")
         entry = _pricing_entry_from_metadata(
-            fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""),
+            endpoint_metadata,
             route.model,
             source_url=f"{route.base_url.rstrip('/')}/models",
             pricing_version="openai-compatible-models-api",
         )
         if entry:
             return entry
+        # A LiteLLM proxy alias with no rate card of its own (LiteLLM reports
+        # $0 for upstreams it does not know, e.g. Bedrock Mantle GPT-5.6).
+        # /model/info still tells us the upstream model id, so price that
+        # through the official-docs snapshot instead of leaving the session
+        # as "unknown" with a NULL cost.
+        upstream_entry = _lookup_upstream_pricing(endpoint_metadata.get(route.model) or {})
+        if upstream_entry:
+            return upstream_entry
     return _lookup_official_docs_pricing(route)
+
+
+_LITELLM_UPSTREAM_PROVIDER_PREFIXES = {
+    "bedrock": "bedrock",
+    "bedrock_converse": "bedrock",
+    "bedrock_mantle": "bedrock",
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "gemini": "google",
+    "vertex_ai": "google",
+    "fireworks_ai": "fireworks",
+    "minimax": "minimax",
+}
+
+
+def _lookup_upstream_pricing(endpoint_entry: Dict[str, Any]) -> Optional[PricingEntry]:
+    """Price a proxy alias by the upstream model LiteLLM routes it to.
+
+    ``upstream_model`` is LiteLLM's ``litellm_params.model`` string, e.g.
+    ``bedrock/us.anthropic.claude-fable-5-1``,
+    ``bedrock/converse/amazon.nova-lite-v1:0`` or
+    ``openai/responses/openai.gpt-5.6-sol`` (Bedrock Mantle: an ``openai/``
+    prefix whose ``api_base`` is ``bedrock-mantle.<region>.api.aws``).
+    """
+    upstream = endpoint_entry.get("upstream_model")
+    if not isinstance(upstream, str) or "/" not in upstream:
+        return None
+    prefix, _, remainder = upstream.partition("/")
+    prefix = prefix.lower()
+    # Strip LiteLLM API-mode selectors (``converse/``, ``responses/``, ...).
+    for mode in ("converse/", "responses/", "invoke/", "chat/"):
+        if remainder.startswith(mode):
+            remainder = remainder[len(mode):]
+    provider = _LITELLM_UPSTREAM_PROVIDER_PREFIXES.get(prefix)
+    api_base = str(endpoint_entry.get("upstream_api_base") or "")
+    if prefix == "openai" and base_url_host_matches(api_base, "api.aws"):
+        provider = "bedrock"
+    if not provider or not remainder:
+        return None
+    return _lookup_official_docs_pricing(
+        BillingRoute(provider=provider, model=remainder, base_url=api_base, billing_mode="official_docs_snapshot")
+    )
 
 
 def normalize_usage(
