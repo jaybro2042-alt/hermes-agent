@@ -2154,6 +2154,51 @@ class TestStaleBaseUrlWarning:
 
 
 class TestAuxiliaryTaskExtraBody:
+    def test_reasoning_effort_does_not_synthesize_extra_body(self):
+        from agent.auxiliary_client import _get_task_extra_body
+
+        config = {"auxiliary": {"compression": {"reasoning_effort": "low"}}}
+        with patch("hermes_cli.config.load_config_readonly", return_value=config):
+            assert _get_task_extra_body("compression") == {}
+
+    def test_explicit_reasoning_passes_through(self):
+        from agent.auxiliary_client import (
+            _get_task_extra_body,
+            _get_task_reasoning_config,
+        )
+
+        extra_body = {"reasoning": {"effort": "none"}}
+        config = {"auxiliary": {"compression": {
+            "reasoning_effort": "low", "extra_body": extra_body,
+        }}}
+        with patch("hermes_cli.config.load_config_readonly", return_value=config):
+            result = _get_task_extra_body("compression")
+            assert result == extra_body
+            assert result is not extra_body
+            assert _get_task_reasoning_config("compression") is None
+
+    @pytest.mark.parametrize("effort, expected", [
+        ("low", {"enabled": True, "effort": "low"}),
+        ("none", {"enabled": False}),
+        (None, None),
+        ("", None),
+    ])
+    def test_task_reasoning_config(self, effort, expected):
+        from agent.auxiliary_client import _get_task_reasoning_config
+
+        config = {"auxiliary": {"compression": {"reasoning_effort": effort}}}
+        with patch("hermes_cli.config.load_config_readonly", return_value=config):
+            assert _get_task_reasoning_config("compression") == expected
+
+    def test_invalid_task_reasoning_effort_warns(self, caplog):
+        from agent.auxiliary_client import _get_task_reasoning_config
+
+        config = {"auxiliary": {"compression": {"reasoning_effort": "invalid"}}}
+        with patch("hermes_cli.config.load_config_readonly", return_value=config):
+            assert _get_task_reasoning_config("compression") is None
+        assert "auxiliary.compression.reasoning_effort" in caplog.text
+        assert "not a valid level" in caplog.text
+
     def test_sync_call_merges_task_extra_body_from_config(self):
         client = MagicMock()
         client.base_url = "https://api.example.com/v1"
@@ -2225,14 +2270,15 @@ class TestAuxiliaryTaskExtraBody:
     def test_moa_tasks_reject_task_level_reasoning_effort(self, moa_task, caplog):
         """MoA reasoning is per-slot in the preset — the auxiliary-task
         shorthand is ignored with a warning pointing at the preset config."""
-        from agent.auxiliary_client import _get_task_extra_body
+        from agent.auxiliary_client import _get_task_extra_body, _get_task_reasoning_config
 
         config = {"auxiliary": {moa_task: {"reasoning_effort": "xhigh"}}}
         with patch("hermes_cli.config.load_config", return_value=config), patch("hermes_cli.config.load_config_readonly", return_value=config), \
              caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
-            result = _get_task_extra_body(moa_task)
+            assert _get_task_extra_body(moa_task) == {}
+            result = _get_task_reasoning_config(moa_task)
 
-        assert "reasoning" not in result
+        assert result is None
         assert any("per-slot" in rec.message for rec in caplog.records)
 
 
@@ -2638,6 +2684,90 @@ class TestAnthropicAuxiliaryReasoningTranslation:
 class TestAuxiliaryProviderProfileReasoning:
     """Auxiliary calls must reuse provider-profile reasoning wire shapes."""
 
+    def test_custom_reasoning_uses_top_level_effort(self):
+        kwargs = _build_call_kwargs(
+            "custom",
+            "test-model",
+            [{"role": "user", "content": "hi"}],
+            reasoning_config={"enabled": True, "effort": "low"},
+            base_url="http://127.0.0.1:4000/v1",
+        )
+
+        assert kwargs["reasoning_effort"] == "low"
+        assert "reasoning" not in kwargs.get("extra_body", {})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize("provider", ["custom", "openrouter", "nous", "unprofiled"])
+    async def test_task_reasoning_projects_through_profile(self, async_mode, provider):
+        from hermes_constants import get_hermes_home
+
+        # Exercise the real config reader and provider profiles in the isolated
+        # HERMES_HOME; only the provider resolution and SDK client are faked.
+        (get_hermes_home() / "config.yaml").write_text(
+            "auxiliary:\n  compression:\n    reasoning_effort: low\n"
+        )
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+        client = MagicMock()
+        client.base_url = "http://127.0.0.1:4000/v1"
+        create = AsyncMock(return_value=response) if async_mode else MagicMock(return_value=response)
+        client.chat.completions.create = create
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=(provider, "test-model", client.base_url, "test-key", None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(client, "test-model")):
+            call = async_call_llm if async_mode else call_llm
+            result = call(task="compression", messages=[{"role": "user", "content": "hi"}])
+            if async_mode:
+                result = await result
+
+        assert result is response
+        kwargs = create.call_args.kwargs
+        if provider == "custom":
+            assert kwargs["reasoning_effort"] == "low"
+            assert "reasoning" not in kwargs.get("extra_body", {})
+        else:
+            assert kwargs["extra_body"]["reasoning"] == {"enabled": True, "effort": "low"}
+            assert "reasoning_effort" not in kwargs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize("overrides", [
+        {"reasoning_config": {"enabled": True, "effort": "high"}},
+        {"extra_body": {"reasoning": {"effort": "none"}}},
+    ])
+    async def test_caller_reasoning_overrides_task_shorthand(self, async_mode, overrides):
+        client = MagicMock()
+        client.base_url = "http://127.0.0.1:4000/v1"
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+        create = AsyncMock(return_value=response) if async_mode else MagicMock(return_value=response)
+        client.chat.completions.create = create
+        config = {"auxiliary": {"compression": {"reasoning_effort": "low"}}}
+
+        with patch("hermes_cli.config.load_config_readonly", return_value=config), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("custom", "test-model", client.base_url, "test-key", None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(client, "test-model")):
+            call = async_call_llm if async_mode else call_llm
+            result = call(task="compression", messages=[{"role": "user", "content": "hi"}], **overrides)
+            if async_mode:
+                result = await result
+
+        assert result is response
+        kwargs = create.call_args.kwargs
+        if "reasoning_config" in overrides:
+            assert kwargs["reasoning_effort"] == "high"
+            assert "reasoning" not in kwargs.get("extra_body", {})
+        else:
+            assert kwargs["extra_body"]["reasoning"] == {"effort": "none"}
+            assert "reasoning_effort" not in kwargs
+
     def test_kimi_reasoning_uses_top_level_effort(self):
         kwargs = _build_call_kwargs(
             "kimi-coding",
@@ -2690,6 +2820,111 @@ class TestAuxiliaryProviderProfileReasoning:
         final_kwargs = create.call_args.kwargs
         assert final_kwargs["reasoning_effort"] == "high"
         assert "reasoning" not in final_kwargs.get("extra_body", {})
+
+
+_BEDROCK_REASONING_ERROR = (
+    "Error code: 400 - {'error': {'message': 'litellm.BadRequestError: BedrockException - "
+    '{"message":"The model returned the following errors: reasoning: Extra inputs are not permitted"}'
+    "'}}"
+)
+
+
+class TestUnsupportedReasoningRetry:
+    @pytest.mark.parametrize("message", [
+        _BEDROCK_REASONING_ERROR,
+        "HTTP 400: Unrecognized request argument: reasoning",
+        "HTTP 400: Unknown parameter: reasoning",
+        "HTTP 400: Unsupported parameter: reasoning_effort",
+        "HTTP 400: unsupported_parameter: reasoning_effort",
+        "HTTP 400: reasoning is not supported",
+    ])
+    def test_detects_unsupported_reasoning(self, message):
+        from agent.auxiliary_client import _is_unsupported_reasoning_error
+
+        assert _is_unsupported_reasoning_error(RuntimeError(message))
+
+    @pytest.mark.parametrize("message", [
+        "HTTP 400: Invalid value: 'tool'",
+        "HTTP 400: temperature: Extra inputs are not permitted",
+        "HTTP 400: reasoning budget must be positive",
+    ])
+    def test_ignores_other_errors(self, message):
+        from agent.auxiliary_client import _is_unsupported_reasoning_error
+
+        assert not _is_unsupported_reasoning_error(RuntimeError(message))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize("wire_shape", ["top_level", "extra_body", "both"])
+    async def test_retries_once_without_reasoning(self, async_mode, wire_shape, caplog):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+
+        def fake_create(**kwargs):
+            if "reasoning_effort" in kwargs or "reasoning" in kwargs.get("extra_body", {}):
+                raise RuntimeError(_BEDROCK_REASONING_ERROR)
+            return response
+
+        create = AsyncMock(side_effect=fake_create) if async_mode else MagicMock(side_effect=fake_create)
+        client = SimpleNamespace(
+            base_url="http://127.0.0.1:4000/v1",
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        )
+        extra_body = {"metadata": {"source": "test"}}
+        if wire_shape in ("extra_body", "both"):
+            extra_body["reasoning"] = {"enabled": True, "effort": "low"}
+        reasoning_config = (
+            {"enabled": True, "effort": "low"}
+            if wire_shape in ("top_level", "both") else None
+        )
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("custom", "test-model", client.base_url, "test-key", None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(client, "test-model")), \
+             caplog.at_level(logging.INFO, logger="agent.auxiliary_client"):
+            call = async_call_llm if async_mode else call_llm
+            result = call(
+                task="compression", messages=[{"role": "user", "content": "hi"}],
+                extra_body=extra_body, reasoning_config=reasoning_config,
+            )
+            if async_mode:
+                result = await result
+
+        assert result is response
+        assert create.call_count == 2
+        first_kwargs, retry_kwargs = [call.kwargs for call in create.call_args_list]
+        assert ("reasoning_effort" in first_kwargs) == (wire_shape in ("top_level", "both"))
+        assert ("reasoning" in first_kwargs.get("extra_body", {})) == (wire_shape in ("extra_body", "both"))
+        assert "reasoning_effort" not in retry_kwargs
+        assert "reasoning" not in retry_kwargs.get("extra_body", {})
+        assert retry_kwargs["extra_body"]["metadata"] == extra_body["metadata"]
+        assert any("compression" in rec.message and "provider rejected reasoning" in rec.message
+                   and rec.levelno == logging.INFO for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("async_mode", [False, True])
+    async def test_reasoning_retry_failure_propagates(self, async_mode):
+        error = RuntimeError(_BEDROCK_REASONING_ERROR)
+        create = AsyncMock(side_effect=error) if async_mode else MagicMock(side_effect=error)
+        client = SimpleNamespace(
+            base_url="http://127.0.0.1:4000/v1",
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        )
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("custom", "test-model", client.base_url, "test-key", None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(client, "test-model")), \
+             pytest.raises(RuntimeError, match="Extra inputs are not permitted"):
+            call = async_call_llm if async_mode else call_llm
+            result = call(
+                task="compression", messages=[{"role": "user", "content": "hi"}],
+                reasoning_config={"enabled": True, "effort": "low"},
+            )
+            if async_mode:
+                await result
+
+        assert create.call_count == 2
 
 
 class TestCodexAdapterReasoningTranslation:

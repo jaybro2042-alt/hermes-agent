@@ -3637,6 +3637,14 @@ def _is_unsupported_temperature_error(exc: Exception) -> bool:
     return _is_unsupported_parameter_error(exc, "temperature")
 
 
+def _is_unsupported_reasoning_error(exc: Exception) -> bool:
+    """Detect rejected reasoning fields, including LiteLLM/Bedrock validation errors."""
+    err_lower = str(exc).lower()
+    return _is_unsupported_parameter_error(exc, "reasoning") or (
+        "reasoning" in err_lower and "extra inputs are not permitted" in err_lower
+    )
+
+
 def _is_model_not_found_error(exc: Exception) -> bool:
     """Detect "the requested model doesn't exist" errors (404 / invalid model).
 
@@ -7233,49 +7241,42 @@ def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
 
 
 def _get_task_extra_body(task: str) -> Dict[str, Any]:
-    """Read auxiliary.<task>.extra_body and return a shallow copy when valid.
+    """Read auxiliary.<task>.extra_body, preserving explicit wire fields."""
+    raw = _get_auxiliary_task_config(task).get("extra_body")
+    return dict(raw) if isinstance(raw, dict) else {}
 
-    Also folds in ``auxiliary.<task>.reasoning_effort`` as an
-    ``extra_body.reasoning`` config dict ({"enabled": ..., "effort": ...})
-    when set. An explicit ``extra_body.reasoning`` in config wins over the
-    ``reasoning_effort`` shorthand (it is the more specific wire control).
-    Downstream, each wire already translates ``extra_body.reasoning``:
-    chat.completions passes it through, the Codex Responses adapter maps it
-    to top-level ``reasoning``/``include``, and the Anthropic auxiliary
-    client maps it to ``build_anthropic_kwargs(reasoning_config=...)``.
 
-    MoA tasks are excluded by design: reasoning depth for MoA is a per-slot
-    setting in the MoA preset (``moa.presets.<name>.reference_models[].
-    reasoning_effort`` / ``aggregator.reasoning_effort``), not an
-    auxiliary-task knob — an ensemble-wide value would override the
-    per-slot ones.
+def _get_task_reasoning_config(task: str) -> Optional[dict]:
+    """Parse auxiliary.<task>.reasoning_effort for provider-profile projection.
+
+    Explicit extra_body.reasoning takes precedence over the shorthand. MoA
+    reasoning remains a per-slot preset setting, not an auxiliary-task knob.
     """
     task_config = _get_auxiliary_task_config(task)
     raw = task_config.get("extra_body")
-    result = dict(raw) if isinstance(raw, dict) else {}
-    if "reasoning" not in result:
-        effort = task_config.get("reasoning_effort")
-        if effort is not None and effort != "":
-            if task in ("moa_reference", "moa_aggregator"):
-                logger.warning(
-                    "auxiliary.%s.reasoning_effort is not supported — MoA "
-                    "reasoning depth is per-slot: set reasoning_effort on the "
-                    "preset's reference_models entries / aggregator instead "
-                    "(moa.presets.<name>...). Ignoring.",
-                    task,
-                )
-                return result
-            from hermes_constants import parse_reasoning_effort
-            parsed = parse_reasoning_effort(effort)
-            if parsed is not None:
-                result["reasoning"] = parsed
-            else:
-                logger.warning(
-                    "auxiliary.%s.reasoning_effort %r is not a valid level "
-                    "(none, minimal, low, medium, high, xhigh, max, ultra) — ignoring",
-                    task, effort,
-                )
-    return result
+    if isinstance(raw, dict) and "reasoning" in raw:
+        return None
+    effort = task_config.get("reasoning_effort")
+    if effort is None or effort == "":
+        return None
+    if task in ("moa_reference", "moa_aggregator"):
+        logger.warning(
+            "auxiliary.%s.reasoning_effort is not supported — MoA "
+            "reasoning depth is per-slot: set reasoning_effort on the "
+            "preset's reference_models entries / aggregator instead "
+            "(moa.presets.<name>...). Ignoring.",
+            task,
+        )
+        return None
+    from hermes_constants import parse_reasoning_effort
+    parsed = parse_reasoning_effort(effort)
+    if parsed is None:
+        logger.warning(
+            "auxiliary.%s.reasoning_effort %r is not a valid level "
+            "(none, minimal, low, medium, high, xhigh, max, ultra) — ignoring",
+            task, effort,
+        )
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -8182,6 +8183,8 @@ def call_llm(
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    if reasoning_config is None and "reasoning" not in effective_extra_body:
+        reasoning_config = _get_task_reasoning_config(task)
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -8424,6 +8427,40 @@ def call_llm(
                 # payment / auth chains below using the temperature-stripped
                 # kwargs.  Re-raise only if the retry hit something those
                 # chains won't handle.
+                if not (
+                    _is_payment_error(retry_err)
+                    or _is_connection_error(retry_err)
+                    or _is_auth_error(retry_err)
+                    or _is_unsupported_reasoning_error(retry_err)
+                    or "max_tokens" in retry_err_str
+                    or "unsupported_parameter" in retry_err_str
+                ):
+                    raise
+                first_err = retry_err
+                kwargs = retry_kwargs
+
+        if (
+            "reasoning_effort" in kwargs or "reasoning" in kwargs.get("extra_body", {})
+        ) and _is_unsupported_reasoning_error(first_err):
+            retry_kwargs = dict(kwargs)
+            retry_kwargs.pop("reasoning_effort", None)
+            if "extra_body" in retry_kwargs:
+                retry_kwargs["extra_body"] = dict(retry_kwargs["extra_body"])
+                retry_kwargs["extra_body"].pop("reasoning", None)
+            logger.info(
+                "Auxiliary %s: provider rejected reasoning; retrying once without it",
+                task or "call",
+            )
+            try:
+                return _validate_llm_response(
+                    _relay_sync_completion(
+                        client,
+                        retry_kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                    ), task)
+            except Exception as retry_err:
+                retry_err_str = str(retry_err)
                 if not (
                     _is_payment_error(retry_err)
                     or _is_connection_error(retry_err)
@@ -8907,6 +8944,8 @@ async def async_call_llm(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    if reasoning_config is None and "reasoning" not in effective_extra_body:
+        reasoning_config = _get_task_reasoning_config(task)
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -9056,6 +9095,40 @@ async def async_call_llm(
             retry_kwargs.pop("temperature", None)
             logger.info(
                 "Auxiliary %s (async): provider rejected temperature; retrying once without it",
+                task or "call",
+            )
+            try:
+                return _validate_llm_response(
+                    await _relay_async_completion(
+                        client,
+                        retry_kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                    ), task)
+            except Exception as retry_err:
+                retry_err_str = str(retry_err)
+                if not (
+                    _is_payment_error(retry_err)
+                    or _is_connection_error(retry_err)
+                    or _is_auth_error(retry_err)
+                    or _is_unsupported_reasoning_error(retry_err)
+                    or "max_tokens" in retry_err_str
+                    or "unsupported_parameter" in retry_err_str
+                ):
+                    raise
+                first_err = retry_err
+                kwargs = retry_kwargs
+
+        if (
+            "reasoning_effort" in kwargs or "reasoning" in kwargs.get("extra_body", {})
+        ) and _is_unsupported_reasoning_error(first_err):
+            retry_kwargs = dict(kwargs)
+            retry_kwargs.pop("reasoning_effort", None)
+            if "extra_body" in retry_kwargs:
+                retry_kwargs["extra_body"] = dict(retry_kwargs["extra_body"])
+                retry_kwargs["extra_body"].pop("reasoning", None)
+            logger.info(
+                "Auxiliary %s (async): provider rejected reasoning; retrying once without it",
                 task or "call",
             )
             try:
