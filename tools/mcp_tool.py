@@ -476,12 +476,85 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     return env
 
 
+def _coded_error_fields(text: str) -> Optional[Dict[str, Any]]:
+    """Parse a *coded* structured error body out of an MCP error payload.
+
+    Servers that follow the Liminality D-ERRORS wire shape return::
+
+        {"ok": false, "error": {"code": "LIM-ARGS-001", "message": "...",
+                                "hint": "...", "retryable": false,
+                                "correlation_id": "lim-...", "detail": "..."}}
+
+    (a bare ``{"code": ..., "message": ...}`` object is accepted too). Returns
+    the normalised fields — ``code`` and ``message`` always present, the rest
+    only when the server supplied them — or ``None`` when *text* is not such
+    a body, so callers can fall back to the raw string unchanged.
+    """
+    if not text:
+        return None
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    err = parsed.get("error")
+    if not isinstance(err, dict):
+        # tolerate a flat body: {"code": "...", "message": "..."}
+        err = parsed if isinstance(parsed.get("code"), str) else None
+    if not isinstance(err, dict):
+        return None
+    code = err.get("code")
+    message = err.get("message")
+    if not isinstance(code, str) or not code.strip():
+        return None
+    if not isinstance(message, str) or not message.strip():
+        return None
+    fields: Dict[str, Any] = {"code": code.strip(), "message": message.strip()}
+    for key in ("hint", "detail", "correlation_id"):
+        value = err.get(key)
+        if isinstance(value, str) and value.strip():
+            fields[key] = value.strip()
+    if isinstance(err.get("retryable"), bool):
+        fields["retryable"] = err["retryable"]
+    suggestions = err.get("suggestions")
+    if isinstance(suggestions, dict) and suggestions:
+        fields["suggestions"] = suggestions
+    return fields
+
+
+def _format_coded_error(fields: Dict[str, Any]) -> str:
+    """One readable line for a coded error: ``[CODE] message — hint: … (ref …)``."""
+    line = f"[{fields['code']}] {fields['message']}"
+    if fields.get("hint"):
+        line += f" — hint: {fields['hint']}"
+    if fields.get("suggestions"):
+        pairs = ", ".join(f"{k} → {v}" for k, v in fields["suggestions"].items())
+        line += f" — did you mean: {pairs}"
+    if fields.get("detail"):
+        line += f" — detail: {fields['detail']}"
+    if fields.get("correlation_id"):
+        line += f" (ref {fields['correlation_id']})"
+    return line
+
+
 def _sanitize_error(text: str) -> str:
     """Strip credential-like patterns from error text before returning to LLM.
 
     Replaces tokens, keys, and other secrets with [REDACTED] to prevent
     accidental credential exposure in tool error responses.
+
+    When *text* is a coded structured error body (``error.code`` /
+    ``error.message`` / ``error.hint``), it is rendered as one readable line
+    so the model sees the stable code and the fix hint instead of a JSON blob
+    or a bare transport string.
     """
+    coded = _coded_error_fields(text)
+    if coded is not None:
+        text = _format_coded_error(coded)
     return _CREDENTIAL_PATTERN.sub("[REDACTED]", text)
 
 
@@ -4874,6 +4947,17 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     res_text = getattr(getattr(block, "resource", None), "text", None)
                     if res_text:
                         error_text += str(res_text)
+                # Coded structured errors (Liminality D-ERRORS shape:
+                # error.code / message / hint / correlation_id) are rendered
+                # as one readable line by _sanitize_error and also carried as
+                # separate keys so the model can branch on the stable code.
+                coded = _coded_error_fields(error_text)
+                if coded is not None:
+                    extra = {"code": coded["code"]}
+                    for key in ("hint", "retryable", "correlation_id"):
+                        if key in coded:
+                            extra[key] = coded[key]
+                    return tool_error(_sanitize_error(error_text), **extra)
                 return tool_error(_sanitize_error(
                     error_text or "MCP tool returned an error"
                 ))
