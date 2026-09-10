@@ -64,6 +64,38 @@ def test_changed_approved_snapshot_denies_before_request(tmp_path):
         read_snapshot(path, digest)
 
 
+@pytest.mark.parametrize("mode", ["transport-error", "wrong-model", "missing-model"])
+def test_ambiguous_billing_keeps_reservation_without_settlement(mode):
+    events = []
+    gate = RequestReservations(events.append, lambda: '{"ok":true,"reservation_id":"held"}',
+                               {"model": "approved"}, lambda: None)
+    agent = SimpleNamespace(model="approved", provider="custom", api_mode="codex_responses",
+                            _requested_output_cap_from_api_kwargs=lambda kwargs: 128)
+    calls = []
+    def provider_call():
+        calls.append(True)
+        if mode == "transport-error":
+            raise ConnectionError("sensitive provider detail")
+        return SimpleNamespace(usage={"input_tokens": 10, "output_tokens": 1},
+                               _wire_model="different" if mode == "wrong-model" else None)
+    with pytest.raises(PaidRequestStopped) as error:
+        gate.invoke(provider_call, {"input": "bounded evidence"}, agent)
+    assert len(calls) == 1
+    assert not any(event["type"] == "hermes.settle" for event in events)
+    assert "sensitive" not in str(error.value)
+
+
+@pytest.mark.parametrize("kwargs", [{"previous_response_id": "server-state"},
+                                   {"conversation": "server-state"},
+                                   {"tools": [{"type": "web_search"}]}])
+def test_unbounded_provider_context_or_hosted_tools_denied_before_hold(kwargs):
+    events = []
+    gate = RequestReservations(events.append, lambda: '{}', {"model": "approved"}, lambda: None)
+    with pytest.raises(PaidRequestStopped):
+        gate.invoke(lambda: pytest.fail("must not call provider"), kwargs, SimpleNamespace(model="approved"))
+    assert not events
+
+
 def test_credential_helper_requires_admission_and_denies_without_leaking(monkeypatch, capsys):
     from tools import delegation_worker
     calls = []

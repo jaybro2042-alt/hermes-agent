@@ -1030,6 +1030,7 @@ def _consume_codex_event_stream(
     terminal_status: str = "completed"
     terminal_usage: Any = None
     terminal_response_id: str = None
+    terminal_wire_model: str | None = None
     terminal_incomplete_details: Any = None
     terminal_error: Any = None
     saw_terminal = False
@@ -1157,6 +1158,7 @@ def _consume_codex_event_stream(
             saw_terminal = True
             resp_obj = _event_field(event, "response")
             if resp_obj is not None:
+                terminal_wire_model = _event_field(resp_obj, "model")
                 terminal_usage = getattr(resp_obj, "usage", None)
                 if terminal_usage is None and isinstance(resp_obj, dict):
                     terminal_usage = resp_obj.get("usage")
@@ -1216,6 +1218,7 @@ def _consume_codex_event_stream(
     assembled_text = "".join(collected_text_deltas)
 
     final = SimpleNamespace(
+        _wire_model=terminal_wire_model,
         output=output,
         output_text=assembled_text,
         usage=terminal_usage,
@@ -1242,7 +1245,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     from agent import relay_llm
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
-    max_stream_retries = 1
+    max_stream_retries = 0 if getattr(agent, "_paid_supervised", False) else 1
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 

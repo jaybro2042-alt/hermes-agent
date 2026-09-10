@@ -63,6 +63,10 @@ class RequestReservations:
         # Text serialization bounds tokenizer input conservatively. Remote image
         # and audio payloads need a separate pricing adapter; deny them explicitly.
         serialized = json.dumps(kwargs, ensure_ascii=True, default=str)
+        if any(key in kwargs for key in ("previous_response_id", "conversation")):
+            raise PaidRequestStopped("Server-held context has no bounded worker pricing adapter")
+        if any(tool.get("type") != "function" for tool in kwargs.get("tools", [])):
+            raise PaidRequestStopped("Provider-hosted tools have no bounded worker pricing adapter")
         if any(marker in serialized for marker in ('"image_url"', '"input_image"', '"input_audio"', '"file_id"')):
             raise PaidRequestStopped("Paid worker has no bounded multimodal pricing adapter")
         output_bound = agent._requested_output_cap_from_api_kwargs(kwargs)
@@ -78,9 +82,18 @@ class RequestReservations:
             raise PaidRequestStopped(reservation.get("error", "Shared budget cannot admit this request"))
         # Exceptions deliberately retain the reservation: billing is ambiguous,
         # so another attempt must reserve another bounded amount.
-        response = call()
+        try:
+            response = call()
+        except Exception:
+            raise PaidRequestStopped("Provider call failed; preserve partial work and retain its reservation") from None
         if not getattr(response, "usage", None):
             raise PaidRequestStopped("Provider response has no usage; reservation retained")
+        returned_model = getattr(response, "_wire_model", None) if agent.api_mode == "codex_responses" else getattr(response, "model", None)
+        self.emit({"type": "hermes.provider_response", "requested_model": agent.model,
+                   "response_model": returned_model, "provider": agent.provider})
+        if not returned_model or returned_model not in {self.route["model"], self.route.get("upstream_model")}:
+            # Unknown-route billing cannot refund a hold priced for our route.
+            raise PaidRequestStopped("Provider returned an unverified model; reservation retained")
         from agent.usage_pricing import normalize_usage
         usage = normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode)
         self.emit({"type": "hermes.settle", "reservation_id": reservation["reservation_id"],
@@ -91,11 +104,6 @@ class RequestReservations:
             raise PaidRequestStopped("Paid supervisor settlement channel closed") from exc
         if not settled.get("ok"):
             raise PaidRequestStopped("Provider exceeded the approved request bound")
-        returned_model = getattr(response, "model", None)
-        self.emit({"type": "hermes.provider_response", "requested_model": agent.model,
-                   "response_model": returned_model, "provider": agent.provider})
-        if returned_model and returned_model not in {self.route["model"], self.route.get("upstream_model")}:
-            raise PaidRequestStopped("Provider returned a different model from the approved route")
         return response
 
 
@@ -149,6 +157,8 @@ def worker_main(request, catalog, emit, verify_snapshot):
         raise ValueError("Worker requires the canonical paid supervisor")
     emit({"type": "hermes.receipt", "receipt": receipt})
     runtime = resolve_route_runtime(route)
+    if runtime.get("api_mode") not in {"chat_completions", "codex_responses"}:
+        raise PaidRequestStopped("Approved route has no tested bounded worker API adapter")
     if route.get("base_url") and str(runtime.get("base_url", "")).rstrip("/") != route["base_url"].rstrip("/"):
         raise ValueError("Resolved provider endpoint does not match the approved route")
 
@@ -156,6 +166,9 @@ def worker_main(request, catalog, emit, verify_snapshot):
     reservations = RequestReservations(emit, sys.stdin.readline, route, verify_snapshot)
 
     class ReservedAgent(AIAgent):
+        def _handle_max_iterations(self, messages, api_call_count):
+            raise PaidRequestStopped("Iteration limit reached; preserve partial work without an unreserved summary call")
+
         def _interruptible_api_call(self, api_kwargs):
             return reservations.invoke(lambda: super(ReservedAgent, self)._interruptible_api_call(api_kwargs), api_kwargs, self)
 
@@ -220,6 +233,7 @@ def worker_main(request, catalog, emit, verify_snapshot):
         max_tokens=route.get("max_output_tokens", 4096),
     )
     agent._fallback_chain = []
+    agent._paid_supervised = True
     agent.context_compressor.enabled = False
     if isinstance(getattr(agent, "_client_kwargs", None), dict):
         agent._client_kwargs["max_retries"] = 0
