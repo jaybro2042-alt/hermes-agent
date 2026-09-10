@@ -28,7 +28,8 @@ def discover_worker_handoff_tools(toolsets):
     # MCP sampling would be an auxiliary model call outside this reservation
     # adapter. Keep only the existing handoff schema in each worker prompt.
     scoped = {**config, "sampling": {"enabled": False}, "elicitation": {"enabled": False},
-              "tools": {"include": ["handoff"]}, "connect_timeout": 15, "timeout": 60}
+              "tools": {"include": ["handoff"], "resources": False, "prompts": False},
+              "connect_timeout": 15, "timeout": 60}
     registered = register_mcp_servers({"liminal": scoped})
     if "mcp__liminal__handoff" not in registered:
         raise PaidRequestStopped("Remote handoff tool discovery failed; no worker inference started")

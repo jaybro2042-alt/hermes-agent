@@ -30,6 +30,8 @@ def test_worker_discovers_only_handoff_without_sampling(monkeypatch):
     discover_worker_handoff_tools(["mcp-liminal"])
     assert list(configs[0]) == ["liminal"]
     assert configs[0]["liminal"]["tools"]["include"] == ["handoff"]
+    assert configs[0]["liminal"]["tools"]["resources"] is False
+    assert configs[0]["liminal"]["tools"]["prompts"] is False
     assert configs[0]["liminal"]["sampling"]["enabled"] is False
     monkeypatch.setattr(mcp_tool, "register_mcp_servers", lambda cfg: [])
     with pytest.raises(PaidRequestStopped, match="no worker inference"):
