@@ -468,6 +468,9 @@ def _normalize_role(r: Optional[str]) -> str:
     _get_orchestrator_enabled).  _build_child_agent adds a second
     degrade layer for depth/kill-switch bounds.
     """
+    from tools.delegation_process import paid_config
+    if paid_config(_load_config()):
+        return str(r or "medium").strip().lower()
     if r is None or not r:
         return "leaf"
     r_norm = str(r).strip().lower()
@@ -606,6 +609,9 @@ def _get_max_spawn_depth() -> int:
     extra level multiplies API cost, so raise it deliberately.
     """
     cfg = _load_config()
+    from tools.delegation_process import paid_config
+    if paid_config(cfg):
+        return 3
     val = cfg.get("max_spawn_depth")
     if val is None:
         return MAX_DEPTH
@@ -1222,6 +1228,11 @@ def _build_child_agent(
     routing subagents to a different provider:model pair (e.g. cheap/fast
     model on OpenRouter while the parent runs on Nous Portal).
     """
+    from tools.delegation_process import ProcessChild, paid_config
+    if paid_config(_load_config()):
+        return ProcessChild(config=_load_config(), task_index=task_index, goal=goal,
+                            context=context, parent_agent=parent_agent, role=role,
+                            max_iterations=max_iterations, task_count=task_count)
     from run_agent import AIAgent
     import uuid as _uuid
 
@@ -1564,6 +1575,8 @@ def _build_child_agent(
     parent_sid = getattr(parent_agent, "session_id", None)
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
+        # Preserve the live checkout's uncommitted role-ledger correction.
+        child._session_init_model_config["_delegate_role"] = effective_role
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -1971,6 +1984,9 @@ def _run_single_child(
     Run a pre-built child agent. Called from within a thread.
     Returns a structured result dict.
     """
+    from tools.delegation_process import ProcessChild
+    if isinstance(child, ProcessChild):
+        return child.run_entry(task_index)
     child_start = time.monotonic()
 
     # Get the progress callback from the child agent
@@ -2811,7 +2827,14 @@ def delegate_task(
         )
 
     # Normalise the top-level role once; per-task overrides re-normalise.
-    top_role = _normalize_role(role)
+    from tools.delegation_process import paid_config, select_tier
+    if paid_config(_load_config()) and not role:
+        try:
+            top_role = select_tier(None, getattr(parent_agent, "_dispatch_tier", "director"))
+        except ValueError as exc:
+            return tool_error(str(exc))
+    else:
+        top_role = _normalize_role(role)
 
     # Background (async) delegation now applies to BOTH single tasks and
     # batches. A batch is dispatched as ONE async unit: the whole fan-out runs
@@ -2857,7 +2880,11 @@ def delegate_task(
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        from tools.delegation_process import paid_config, select_tier
+        if paid_config(cfg):
+            creds = dict.fromkeys(("model", "provider", "base_url", "api_key", "api_mode"))
+        else:
+            creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -2895,6 +2922,11 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        if paid_config(cfg):
+            try:
+                select_tier(task.get("role") or top_role, getattr(parent_agent, "_dispatch_tier", "director"))
+            except ValueError as exc:
+                return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -3826,6 +3858,19 @@ def _build_dynamic_schema_overrides() -> dict:
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
 
+    from tools.delegation_process import paid_config
+    if paid_config(_load_config()):
+        import copy
+        overrides_params = copy.deepcopy(overrides_params)
+        tiers = ["senior", "medium", "fast"]
+        description = ("Choose a strictly lower tier: senior, medium, or fast. Models are assigned by the "
+                       "operator's editable route catalog. Every descendant shares the first worker's "
+                       "15-minute deadline and $5 maximum; no automatic renewal. Director coordinates "
+                       "tasks and synthesizes results. Workers can delegate to any lower tier.")
+        overrides_params["properties"]["role"].update(enum=tiers, description=description)
+        overrides_params["properties"]["tasks"]["items"]["properties"]["role"].update(enum=tiers, description=description)
+        return {"description": "Delegate focused work to an isolated paid worker. " + description,
+                "parameters": overrides_params}
     return {
         "description": _build_top_level_description(),
         "parameters": overrides_params,

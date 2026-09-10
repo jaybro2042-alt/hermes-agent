@@ -1598,6 +1598,14 @@ DEFAULT_CONFIG = {
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
     # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
     "delegation": {
+        # Paid execution is explicitly enabled by the operator after validating
+        # their codex-bedrock launcher and route catalog. No model can set this.
+        "paid_dispatch": {
+            "enabled": False,
+            "catalog_path": "~/.config/physea/dispatch-routes.json",
+            "launcher": "codex-bedrock",
+            "allow_host_desktop": False,
+        },
         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
