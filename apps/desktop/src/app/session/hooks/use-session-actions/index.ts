@@ -239,6 +239,8 @@ export function useSessionActions({
     const routedStoredSessionId = getRoutedStoredSessionId()
 
     if (
+      (storedIdRotation.profile !== undefined &&
+        normalizeProfileKey(storedIdRotation.profile) !== normalizeProfileKey($activeGatewayProfile.get())) ||
       activeSessionIdRef.current !== storedIdRotation.runtimeSessionId ||
       selectedStoredSessionId !== storedIdRotation.previousStoredSessionId ||
       (routedStoredSessionId !== null && routedStoredSessionId !== storedIdRotation.previousStoredSessionId)
@@ -256,6 +258,24 @@ export function useSessionActions({
     const nextId = storedIdRotation.nextStoredSessionId
     const sessions = $sessions.get()
     const resolvedNext = resolveComposerSessionKey(nextId, sessions)
+
+    if (storedIdRotation.kind === 'handoff') {
+      // A handoff is a new runtime and lineage, not a compressed source tip.
+      // Move unsent work to the successor's actual composer key even before
+      // its sidebar row arrives. Leave overlays and the source cache alone.
+      if (routedStoredSessionId === previousId) {
+        const sourceKey = resolveComposerSessionKey(previousId, sessions) ?? previousId
+        const targetKey = resolvedNext ?? nextId
+        migrateSessionDraft(sourceKey, targetKey)
+        migrateQueuedPrompts(sourceKey, targetKey)
+        if (sourceKey !== previousId) {
+          migrateSessionDraft(previousId, targetKey)
+          migrateQueuedPrompts(previousId, targetKey)
+        }
+        navigate(sessionRoute(nextId), { replace: true })
+      }
+      return
+    }
 
     const durableKey =
       resolvedNext && resolvedNext !== nextId

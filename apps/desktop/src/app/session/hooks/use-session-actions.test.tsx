@@ -7,6 +7,7 @@ import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tre
 import { getSession, getSessionMessages, type SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
+import { clearQueuedPrompts, enqueueQueuedPrompt, getQueuedPrompts } from '@/store/composer-queue'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
 import {
@@ -176,7 +177,127 @@ describe('active stored-session id rotation routing', () => {
     setActiveSessionId(null)
     setActiveSessionStoredIdRotation(null)
     setSelectedStoredSessionId(null)
+    setSessions([])
+    for (const key of ['stored-A', 'stored-B', 'root-A']) {
+      clearSessionDraft(key)
+      clearQueuedPrompts(key)
+    }
     vi.restoreAllMocks()
+  })
+
+  it.each([false, true])('carries unsent work to a handoff successor with sidebar row present=%s', async rowPresent => {
+    setSessions([
+      storedSession({ id: 'stored-A', _lineage_root_id: 'root-A' }),
+      ...(rowPresent ? [storedSession({ id: 'stored-B', _lineage_root_id: 'stored-B' })] : [])
+    ])
+    stashSessionDraft('root-A', 'Unsent user draft', [])
+    enqueueQueuedPrompt('root-A', { text: 'Queued user work', attachments: [] })
+    const navigate = vi.fn()
+    render(
+      <StoredIdRotationHarness
+        activeSessionIdRef={{ current: 'runtime-A' }}
+        getRoutedStoredSessionId={() => 'stored-A'}
+        navigate={navigate}
+        selectedStoredSessionIdRef={{ current: 'stored-A' }}
+      />
+    )
+    act(() =>
+      setActiveSessionStoredIdRotation({
+        kind: 'handoff',
+        nextStoredSessionId: 'stored-B',
+        previousStoredSessionId: 'stored-A',
+        runtimeSessionId: 'runtime-A'
+      })
+    )
+    await waitFor(() => expect(navigate).toHaveBeenCalled())
+    expect(takeSessionDraft('stored-B').text).toBe('Unsent user draft')
+    expect(getQueuedPrompts('stored-B').map(entry => entry.text)).toEqual(['Queued user work'])
+    expect(getQueuedPrompts('root-A')).toEqual([])
+  })
+
+  it('preserves an existing successor draft and appends the source queue', async () => {
+    setSessions([])
+    stashSessionDraft('stored-A', 'Source draft', [])
+    stashSessionDraft('stored-B', 'Newer successor draft', [])
+    enqueueQueuedPrompt('stored-A', { text: 'Source queue', attachments: [] })
+    enqueueQueuedPrompt('stored-B', { text: 'Successor queue', attachments: [] })
+    const navigate = vi.fn()
+    render(
+      <StoredIdRotationHarness
+        activeSessionIdRef={{ current: 'runtime-A' }}
+        getRoutedStoredSessionId={() => 'stored-A'}
+        navigate={navigate}
+        selectedStoredSessionIdRef={{ current: 'stored-A' }}
+      />
+    )
+    act(() =>
+      setActiveSessionStoredIdRotation({
+        kind: 'handoff',
+        nextStoredSessionId: 'stored-B',
+        previousStoredSessionId: 'stored-A',
+        runtimeSessionId: 'runtime-A'
+      })
+    )
+    await waitFor(() => expect(navigate).toHaveBeenCalled())
+    expect(takeSessionDraft('stored-B').text).toBe('Newer successor draft')
+    expect(takeSessionDraft('stored-A').text).toBe('Source draft')
+    expect(getQueuedPrompts('stored-B').map(entry => entry.text)).toEqual(['Successor queue', 'Source queue'])
+  })
+
+  it('follows a handoff through route resume without relabeling the source cache', async () => {
+    const activeSessionIdRef = { current: 'runtime-A' }
+    const selectedStoredSessionIdRef = { current: 'stored-A' }
+    const navigate = vi.fn()
+    setSelectedStoredSessionId('stored-A')
+    render(
+      <StoredIdRotationHarness
+        activeSessionIdRef={activeSessionIdRef}
+        getRoutedStoredSessionId={() => 'stored-A'}
+        navigate={navigate}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+      />
+    )
+    act(() =>
+      setActiveSessionStoredIdRotation({
+        kind: 'handoff',
+        nextStoredSessionId: 'stored-B',
+        previousStoredSessionId: 'stored-A',
+        runtimeSessionId: 'runtime-A'
+      })
+    )
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith(sessionRoute('stored-B'), { replace: true }))
+    expect(activeSessionIdRef.current).toBe('runtime-A')
+    expect(selectedStoredSessionIdRef.current).toBe('stored-A')
+    expect($selectedStoredSessionId.get()).toBe('stored-A')
+  })
+
+  it.each(['overlay', 'different-route', 'different-profile'])('does not hijack %s during handoff', async kind => {
+    const activeSessionIdRef = { current: 'runtime-A' }
+    const selectedStoredSessionIdRef = { current: 'stored-A' }
+    const navigate = vi.fn()
+    setSelectedStoredSessionId('stored-A')
+    render(
+      <StoredIdRotationHarness
+        activeSessionIdRef={activeSessionIdRef}
+        getRoutedStoredSessionId={() =>
+          kind === 'overlay' ? null : kind === 'different-route' ? 'stored-C' : 'stored-A'
+        }
+        navigate={navigate}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+      />
+    )
+    act(() =>
+      setActiveSessionStoredIdRotation({
+        kind: 'handoff',
+        ...(kind === 'different-profile' ? { profile: 'unrelated-profile' } : {}),
+        nextStoredSessionId: 'stored-B',
+        previousStoredSessionId: 'stored-A',
+        runtimeSessionId: 'runtime-A'
+      })
+    )
+    await waitFor(() => expect($activeSessionStoredIdRotation.get()).toBeNull())
+    expect(navigate).not.toHaveBeenCalled()
+    expect(selectedStoredSessionIdRef.current).toBe('stored-A')
   })
 
   it('follows a rotation while the same conversation still owns the foreground route', async () => {

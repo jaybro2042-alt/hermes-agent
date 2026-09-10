@@ -47,6 +47,7 @@ import {
   $currentModel,
   $currentProvider,
   sessionMatchesStoredId,
+  setActiveSessionStoredIdRotation,
   setCurrentBranch,
   setCurrentCwd,
   setCurrentFastMode,
@@ -330,6 +331,46 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           } else {
             notifySessionsChanged()
           }
+        }
+
+        return
+      } else if (event.type === 'handoff.successor.created') {
+        // Only the authenticated backend can acknowledge the remote checkpoint
+        // and publish its durable successor. Never follow another tab/profile.
+        const handoff = payload as
+          | {
+              acknowledged?: boolean
+              parent_runtime_id?: string
+              source_session_id?: string
+              successor_session_id?: string
+              profile?: string
+            }
+          | undefined
+        const profile = normalizeProfileKey(event.profile || handoff?.profile || activeGatewayProfile)
+
+        if (profile !== normalizeProfileKey($activeGatewayProfile.get())) {
+          return
+        }
+
+        notifySessionsChanged()
+
+        if (
+          handoff?.acknowledged === true &&
+          isActiveEvent &&
+          handoff.parent_runtime_id === sessionId &&
+          typeof handoff.source_session_id === 'string' &&
+          handoff.source_session_id.trim() &&
+          typeof handoff.successor_session_id === 'string' &&
+          handoff.successor_session_id.trim() &&
+          handoff.source_session_id !== handoff.successor_session_id
+        ) {
+          setActiveSessionStoredIdRotation({
+            kind: 'handoff',
+            profile,
+            runtimeSessionId: sessionId,
+            previousStoredSessionId: handoff.source_session_id,
+            nextStoredSessionId: handoff.successor_session_id
+          })
         }
 
         return
