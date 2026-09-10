@@ -111,6 +111,10 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    with _session_db(session) as db:
+        continuation = db.get_acknowledged_successor(_session_lookup_key(session)) if db is not None else None
+    if isinstance(continuation, dict) and continuation:
+        return _err(rid, 4012, "source paused after verified handoff; resume " + continuation["successor_session_id"])
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     if truncate_user_ordinal is not None and isinstance(text, str):

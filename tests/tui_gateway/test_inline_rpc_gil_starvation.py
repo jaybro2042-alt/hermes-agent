@@ -76,6 +76,7 @@ def capture(server):
 # seconds when the GIL is contended by concurrent agent turns.
 
 FRONTEND_POLLED_RPCS = [
+    "handoff.successor.create",  # store verification / real agent build
     "session.active_list",   # live-session rehydrate — in-memory registry
     "session.list",          # loads session list — SQLite query
     "pet.info",              # petdex poll — file/network read

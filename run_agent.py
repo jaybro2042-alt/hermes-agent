@@ -3079,6 +3079,32 @@ class AIAgent:
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
 
+    def pause_for_handoff(self, successor_session_id: str) -> None:
+        """Pause this source's inference without destroying its context/tools.
+
+        Called only after the owner has verified and durably acknowledged the
+        successor. Unlike interrupt(), this does not cancel children or tool
+        workers; their evidence and original budget ownership remain intact.
+        """
+        if not successor_session_id or successor_session_id == getattr(self, "session_id", None):
+            raise ValueError("handoff requires a distinct successor")
+        self._handoff_successor_id = successor_session_id
+        self._interrupt_requested = True
+        self._interrupt_message = None
+        self._pending_redirect = None
+        abort = getattr(self, "_active_request_abort", None)
+        if callable(abort):
+            try:
+                abort("handoff_pause")
+            except Exception:
+                logger.warning("Active request abort failed during handoff pause", exc_info=True)
+        native = getattr(getattr(self, "_codex_session", None), "request_interrupt", None)
+        if callable(native):
+            try:
+                native()
+            except Exception:
+                logger.warning("Native turn interrupt failed during handoff pause", exc_info=True)
+
     def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
         """Clear the interrupt request and per-thread tool signal.
 
@@ -7164,6 +7190,11 @@ class AIAgent:
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        if successor := getattr(self, "_handoff_successor_id", None):
+            return {"final_response": "Source paused after verified handoff; resume the acknowledged successor.",
+                "messages": conversation_history or getattr(self, "_session_messages", []) or [],
+                "completed": False, "interrupted": True, "api_calls": 0,
+                "error": "handoff_source_paused", "successor_session_id": successor}
         from agent.aux_accounting import (
             reset_accounting_context,
             set_accounting_context,

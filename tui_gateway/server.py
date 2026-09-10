@@ -196,6 +196,9 @@ _LONG_HANDLERS = frozenset(
         # is two serial round-trips); keep them off the main stdin loop so a slow
         # portal can't stall approval.respond / session.interrupt / other RPCs.
         "billing.state",
+        # Remote store verification and actual successor construction can
+        # block; never hold the WebSocket reader while they complete.
+        "handoff.successor.create",
         "subscription.state",
         # Subscription change (V3): preview + the pending-change mutations + upgrade
         # each do a blocking portal round-trip (preview + upgrade also hit Stripe,
@@ -745,11 +748,14 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
                     # repeats on every inbound message.  (#60609)
                     row = db.get_session(session_id)
                     source = (row or {}).get("source", "")
-                    _tui_owns_lifecycle = not _is_gateway_owned_source(source)
+                    _tui_owns_lifecycle = not (_is_gateway_owned_source(source)
+                        or (isinstance(row, dict) and bool(row.get("session_key") and row.get("chat_id"))))
                     if _tui_owns_lifecycle:
                         db.end_session(session_id, end_reason)
         except Exception:
             pass
+
+    session["_tui_owns_lifecycle"] = _tui_owns_lifecycle
 
     # A session's in-flight async delegations end WITH the session (#55578):
     # once nobody owns the return address, a still-running background subagent
@@ -852,7 +858,12 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     try:
         agent = session.get("agent")
         if agent is not None and hasattr(agent, "close"):
-            agent.close()
+            if session.get("_tui_owns_lifecycle", True):
+                agent.close()
+            elif hasattr(agent, "release_clients"):
+                # A viewer may release its HTTP pool, but must not end the
+                # gateway's durable conversation or kill its session tools.
+                agent.release_clients()
     except Exception:
         pass
     # NOTE: the slash-worker is closed inside _finalize_session (the single
@@ -926,6 +937,14 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
     if not session or session.get("_finalized"):
         return False
     if session.get("running"):
+        return False
+    # A disconnect is loss of a view, not completion of the conversation.
+    # Retain work-bearing sessions for normal idle-TTL/cap management so a
+    # 20-second network interruption cannot discard queued work or handoffs.
+    if (session.get("history") or session.get("inflight_turn")
+            or session.get("queued_prompt") or session.get("handoff_id")):
+        return False
+    if _is_gateway_owned_source(_session_source(session)):
         return False
     return session.get("transport") is _detached_ws_transport
 

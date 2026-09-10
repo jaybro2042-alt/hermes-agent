@@ -2076,6 +2076,13 @@ class SessionStore:
         """
         if not session_id or self._db is None:
             return session_id
+        continuity_reader = getattr(self._db, "get_continuity_tip", None)
+        if callable(continuity_reader):
+            # Unlike a transient compression lookup, an invalid acknowledged
+            # identity must not fall back to running the preserved source.
+            target = continuity_reader(session_id)
+            if isinstance(target, str) and target:
+                return target
         try:
             return self._db.get_compression_tip(session_id) or session_id
         except Exception:
@@ -2248,6 +2255,12 @@ class SessionStore:
                 entry = self._entries.get(session_key)
                 if entry is not None:
                     existing_session_id = entry.session_id
+
+        # Adopt only the acknowledged successor of this exact conversation.
+        if existing_session_id:
+            self.adopt_acknowledged_successor(session_key, existing_session_id)
+            with self._lock:
+                existing_session_id = self._entries[session_key].session_id
 
         # Compression tip lookup outside the lock (DB I/O).
         canonical_existing_session_id = (
@@ -2809,6 +2822,34 @@ class SessionStore:
             entry.updated_at = _now()
             self._save()
             return entry
+
+    def adopt_acknowledged_successor(self, session_key: str, expected_session_id: str) -> Optional[SessionEntry]:
+        """Adopt an exact verified successor, preserving the originating peer."""
+        if self._db is None:
+            return None
+        receipt = self._db.get_acknowledged_successor(expected_session_id)
+        if not receipt or receipt.get("source_session_id") != expected_session_id:
+            return None
+        source = self._db.get_session(expected_session_id)
+        target = self._db.get_session(receipt.get("successor_session_id", ""))
+        if (not source or not target or source.get("session_key") != session_key
+                or target.get("session_key") != session_key
+                or target.get("parent_session_id") != expected_session_id
+                or target.get("ended_at") is not None
+                or any(source.get(k) != target.get(k) for k in
+                       ("user_id", "chat_id", "chat_type", "thread_id", "profile_name"))):
+            return None
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.session_id != expected_session_id:
+                return None
+            entry.session_id = target["id"]
+            entry.prev_session_id = expected_session_id
+            entry.updated_at = _now()
+            entry.resume_pending = False
+        self._save_entries()
+        return entry
 
     def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.

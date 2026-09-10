@@ -159,6 +159,13 @@ def _(rid, params: dict) -> dict:
     )
 
 
+@method("handoff.successor.create")
+def _(rid, params: dict) -> dict:
+    from tui_gateway import server
+    from tui_gateway.handoff import create_successor
+    return create_successor(server, rid, params)
+
+
 @method("session.list")
 def _(rid, params: dict) -> dict:
     with _profile_db(params) as db:
@@ -361,6 +368,14 @@ def _(rid, params: dict) -> dict:
     # stale parent. Skipped for lazy watch windows, which intentionally attach
     # to the exact child branch they were opened on.
     if found and not is_truthy_value(params.get("lazy", False)):
+        try:
+            successor_reader = getattr(db, "get_continuity_tip", None)
+            continuation = successor_reader(target) if callable(successor_reader) else None
+            if isinstance(continuation, str) and continuation and continuation != target:
+                target = continuation
+                found = db.get_session(target) or found
+        except Exception:
+            return _err(rid, 4009, "successor state unavailable; source retained")
         try:
             tip = db.resolve_resume_session_id(target)
         except Exception:
@@ -3016,3 +3031,12 @@ def _(rid, params: dict) -> dict:
 def register(server) -> None:
     """Bind this module's handlers onto ``server``'s globals and registry."""
     _registry.install(server)
+    from tui_gateway.handoff import register_successor_factory
+
+    def _create_successor(**request):
+        response = server._methods["handoff.successor.create"]("plugin-handoff", request)
+        if isinstance(response.get("result"), dict):
+            return {"ok": True, **response["result"]}
+        return {"ok": False, "error": response.get("error")}
+
+    register_successor_factory(_create_successor)

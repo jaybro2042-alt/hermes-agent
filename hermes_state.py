@@ -4699,6 +4699,125 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    def get_acknowledged_successor(self, source_session_id: str) -> Optional[Dict[str, Any]]:
+        """Read the durable, exact predecessor link; never select a latest chat.
+
+        Schema session-successor/1 lives in state_meta under the source ID.
+        Consumers: handoff retry and gateway session binding. It is independent
+        of mutable model_config so a later usage update cannot erase continuity.
+        """
+        with self._read_ctx() as conn:
+            row = conn.execute("SELECT value FROM state_meta WHERE key = ?",
+                ("session_successor:" + source_session_id,)).fetchone()
+        if not row:
+            return None
+        record = json.loads(row[0])
+        if (not isinstance(record, dict) or record.get("schema") != "session-successor/1"
+                or record.get("source_session_id") != source_session_id):
+            raise ValueError("invalid successor record")
+        return record
+
+    def get_continuity_tip(self, session_id: str) -> str:
+        """Follow alternating compression and acknowledged-handoff boundaries.
+
+        Handoffs are exact links, never the newest arbitrary child. Validate
+        ownership at every edge, including when resuming a pre-compaction ID.
+        """
+        current, seen = session_id, set()
+        for _ in range(64):
+            current = self.get_compression_tip(current) or current
+            if current in seen:
+                raise ValueError("continuation lineage cycle")
+            seen.add(current)
+            record = self.get_acknowledged_successor(current)
+            if not record:
+                return current
+            source = self.get_session(current)
+            target = self.get_session(record.get("successor_session_id", ""))
+            if (not source or not target or target.get("parent_session_id") != current
+                    or (target.get("ended_at") is not None and target.get("end_reason") != "compression")
+                    or any(source.get(field) != target.get(field) for field in
+                        ("profile_name", "session_key", "user_id", "chat_id", "chat_type", "thread_id"))):
+                raise ValueError("successor lineage identity invalid")
+            current = target["id"]
+        raise ValueError("continuation lineage depth exceeded")
+
+    def prepare_successor(self, source_session_id: str, checkpoint_id: str,
+                          candidate_session_id: str) -> Dict[str, Any]:
+        """Reserve the same durable child across pre-ack failure/restart.
+
+        This is not readiness or permission to rebind. Only acknowledge_successor
+        publishes the link consumed by clients and the messaging gateway.
+        """
+        key = "session_successor_pending:" + source_session_id
+        def _do(conn):
+            source = conn.execute("SELECT ended_at FROM sessions WHERE id=?", (source_session_id,)).fetchone()
+            if not source or source["ended_at"] is not None:
+                raise ValueError("source session is not active")
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+            if row:
+                record = json.loads(row[0])
+                if (record.get("schema") != "session-successor-pending/1"
+                        or record.get("source_session_id") != source_session_id
+                        or record.get("checkpoint_id") != checkpoint_id):
+                    raise ValueError("a different or invalid handoff attempt is already pending")
+                return record
+            record = {"schema": "session-successor-pending/1", "source_session_id": source_session_id,
+                "successor_session_id": candidate_session_id, "checkpoint_id": checkpoint_id}
+            conn.execute("INSERT INTO state_meta (key,value) VALUES (?,?)", (key, json.dumps(record)))
+            return record
+        return self._execute_write(_do)
+
+    def acknowledge_successor(self, source_session_id: str, successor_session_id: str,
+                              checkpoint_id: str, *, runtime_id: str, model: str, provider: str) -> Dict[str, Any]:
+        """Atomically publish one verified and constructed successor for a source.
+
+        The session owner calls this after remote verification and successful
+        construction. Source state is preserved. Parent/profile/peer lineage is
+        checked in the same transaction as the immutable link publication.
+        """
+        result = {"schema": "session-successor/1", "source_session_id": source_session_id,
+            "successor_session_id": successor_session_id, "successor_runtime_id": runtime_id,
+            "checkpoint_id": checkpoint_id, "model": model, "provider": provider,
+            "acknowledged_at": time.time()}
+        def _do(conn):
+            source = conn.execute("SELECT * FROM sessions WHERE id = ?", (source_session_id,)).fetchone()
+            target = conn.execute("SELECT * FROM sessions WHERE id = ?", (successor_session_id,)).fetchone()
+            if (not source or not target or source_session_id == successor_session_id
+                    or target["parent_session_id"] != source_session_id
+                    or target["profile_name"] != source["profile_name"]
+                    or source["ended_at"] is not None
+                    or target["ended_at"] is not None):
+                raise ValueError("successor lineage is not valid")
+            if any(target[field] not in (None, "", source[field]) for field in
+                    ("session_key", "user_id", "chat_id", "chat_type", "thread_id", "origin_json")):
+                raise ValueError("successor belongs to a different peer")
+            previous = conn.execute("SELECT value FROM state_meta WHERE key = ?",
+                ("session_successor:" + source_session_id,)).fetchone()
+            if previous:
+                stored = json.loads(previous[0])
+                if stored["successor_session_id"] != successor_session_id or stored["checkpoint_id"] != checkpoint_id:
+                    raise ValueError("source successor already acknowledged")
+                return stored
+            if not conn.execute("SELECT 1 FROM messages WHERE session_id = ? LIMIT 1", (successor_session_id,)).fetchone():
+                raise ValueError("successor has no restored context")
+            # Copy the exact source peer; never a home/default channel or a
+            # caller-supplied address. The gateway adopts only its matching key.
+            conn.execute("UPDATE sessions SET session_key=?, user_id=?, chat_id=?, chat_type=?, thread_id=?, origin_json=? WHERE id=?",
+                (source["session_key"], source["user_id"], source["chat_id"], source["chat_type"],
+                 source["thread_id"], source["origin_json"], successor_session_id))
+            source_config = json.loads(source["model_config"] or "{}")
+            target_config = json.loads(target["model_config"] or "{}")
+            for field in ("_session_role", "_context_manifest", "_answered_decisions",
+                          "_run_budget_id", "_deadline_at", "_delegate_from", "_delegate_role", "_dispatch_route"):
+                if field in source_config:
+                    target_config[field] = source_config[field]
+            conn.execute("UPDATE sessions SET model_config=? WHERE id=?", (json.dumps(target_config), successor_session_id))
+            conn.execute("INSERT INTO state_meta (key,value) VALUES (?,?)",
+                ("session_successor:" + source_session_id, json.dumps(result)))
+            return result
+        return self._execute_write(_do)
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
