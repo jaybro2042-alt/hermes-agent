@@ -221,51 +221,85 @@ def worker_main(request, catalog, emit, verify_snapshot):
                "and tells Jay about real issues. Obtain an independent review before consequential activation.\n"
                "ONBOARDING BRIEF:\n" + json.dumps(request.get("brief", {}), ensure_ascii=False))
     set_approval_callback(lambda *args, **kwargs: "deny")
-    agent = ReservedAgent(
-        model=route["model"], provider=runtime.get("provider"),
-        base_url=runtime.get("base_url"), api_key=runtime.get("api_key"),
-        api_mode=runtime.get("api_mode"), max_iterations=request["max_iterations"],
-        enabled_toolsets=toolsets, disabled_toolsets=_blocked_toolsets_for_role(role) + ["computer_use", "computer"],
-        quiet_mode=True, ephemeral_system_prompt=prompt, platform="subagent",
-        skip_context_files=True, skip_memory=True, session_id=request["session_id"],
-        parent_session_id=request["parent_session_id"], session_db=db,
-        tool_progress_callback=progress, fallback_model=None,
-        max_tokens=route.get("max_output_tokens", 4096),
-    )
-    agent._fallback_chain = []
-    agent._paid_supervised = True
-    agent.context_compressor.enabled = False
-    if isinstance(getattr(agent, "_client_kwargs", None), dict):
-        agent._client_kwargs["max_retries"] = 0
-    if hasattr(agent.client, "max_retries"):
-        agent.client.max_retries = 0
-    agent._delegate_depth = request["depth"]
-    agent._delegate_role = tier
-    agent._dispatch_tier = tier
-    agent._subagent_id = request["subagent_id"]
-    agent._parent_subagent_id = request["parent_subagent_id"]
-    agent._session_init_model_config.update(_delegate_from=request["parent_session_id"],
-                                            _delegate_role=tier, _dispatch_route=request["route_id"],
-                                            _run_budget_id=receipt["budget_id"], _deadline_at=receipt["deadline_at"])
+    def build_agent(session_id, parent_session_id, source=None):
+        selected = {} if source is None else {
+            "reasoning_config": source.reasoning_config, "service_tier": source.service_tier}
+        child = ReservedAgent(
+            model=route["model"], provider=runtime.get("provider"),
+            base_url=runtime.get("base_url"), api_key=runtime.get("api_key"),
+            api_mode=runtime.get("api_mode"), max_iterations=request["max_iterations"],
+            enabled_toolsets=toolsets, disabled_toolsets=_blocked_toolsets_for_role(role) + ["computer_use", "computer"],
+            quiet_mode=True, ephemeral_system_prompt=prompt, platform="subagent",
+            skip_context_files=True, skip_memory=True, session_id=session_id,
+            parent_session_id=parent_session_id, session_db=db,
+            tool_progress_callback=progress, fallback_model=None,
+            max_tokens=route.get("max_output_tokens", 4096), **selected,
+        )
+        child._fallback_chain = []
+        child._paid_supervised = True
+        child.context_compressor.enabled = False
+        if isinstance(getattr(child, "_client_kwargs", None), dict):
+            child._client_kwargs["max_retries"] = 0
+        if hasattr(child.client, "max_retries"):
+            child.client.max_retries = 0
+        child._delegate_depth = request["depth"]
+        child._delegate_role = tier
+        child._dispatch_tier = tier
+        child._subagent_id = request["subagent_id"]
+        child._parent_subagent_id = request["parent_subagent_id"]
+        child._session_init_model_config.update(_delegate_from=request["parent_session_id"],
+            _delegate_role=tier, _dispatch_route=request["route_id"],
+            _run_budget_id=receipt["budget_id"], _deadline_at=receipt["deadline_at"])
+        return child
+
+    from tools.delegation_continuity import NativeWorkerContinuity
+    from tui_gateway.handoff import register_successor_factory, unregister_successor_factory
+    continuity = NativeWorkerContinuity(db, build_agent, receipt, verify_snapshot, emit)
+    agent = build_agent(request["session_id"], request["parent_session_id"])
+    continuity.active = agent
+    successor_factory = continuity.request_successor
+    register_successor_factory(successor_factory)
     def stop(signum, frame):
-        agent.interrupt("Paid worker stopping; preserve partial output")
+        continuity.stop()
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    total_calls, total_cost = 0, 0.0
+    retired_sources = []
+    history = None
+    message = request["goal"]
     try:
         try:
-            result = agent.run_conversation(user_message=request["goal"], task_id=request["subagent_id"],
-                                            stream_callback=lambda delta: emit({"type": "hermes.text", "text": delta}))
-        except PaidRequestStopped as exc:
+            while True:
+                continuity._check()
+                result = agent.run_conversation(user_message=message, conversation_history=history,
+                    task_id=request["subagent_id"],
+                    stream_callback=lambda delta: emit({"type": "hermes.text", "text": delta}))
+                total_calls += result.get("api_calls", 0)
+                total_cost += agent.session_estimated_cost_usd or 0.0
+                resumed = continuity.take_successor()
+                if resumed is None:
+                    break
+                # The source may still own background leaves and terminal
+                # processes. Keep those resources until the whole supervised
+                # worker finishes; AIAgent.close() would cancel them here.
+                retired_sources.append(agent)
+                agent, history = resumed
+                message = "Continue the unfinished authorized assignment from the verified working context above."
+        except (PaidRequestStopped, ValueError) as exc:
             emit({"type": "hermes.result", "result": {"status": "failed", "summary": "", "error": str(exc)}})
             return 4
         summary = result.get("final_response") or ""
         status = "completed" if result.get("completed") and summary.strip() not in {"", "(empty)"} else "interrupted" if result.get("interrupted") else "failed"
         emit({"type": "hermes.result", "result": {"status": status, "summary": summary,
-              "api_calls": result.get("api_calls", 0), "error": result.get("error"),
-              "_child_cost_usd": agent.session_estimated_cost_usd}})
+              "api_calls": total_calls, "error": result.get("error"),
+              "_child_cost_usd": total_cost, "session_id": agent.session_id}})
         return 0 if status == "completed" else 1
     finally:
+        unregister_successor_factory(successor_factory)
+        continuity.close_pending()
         agent.close()
+        for source in retired_sources:
+            source.close()
         db.close()
 
 

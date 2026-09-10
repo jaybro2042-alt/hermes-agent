@@ -150,6 +150,32 @@ def test_native_delegate_builds_proxy_without_inference(tmp_path, monkeypatch):
     assert "lower" in str(invalid)
 
 
+def test_process_wrapper_reports_verified_successor_identity(tmp_path, monkeypatch):
+    from tools import delegation_process
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    catalog = tmp_path / "routes.json"
+    catalog.write_text(json.dumps(_catalog(tmp_path)))
+    parent = SimpleNamespace(session_id="director", enabled_toolsets=["file"],
+                             _active_children=[], _active_children_lock=threading.Lock())
+    child = ProcessChild(config={"paid_dispatch": {"enabled": True, "catalog_path": str(catalog)}},
+        task_index=0, goal="Finish assigned work", context="Preserve source", parent_agent=parent,
+        role="fast", max_iterations=3, task_count=1)
+    receipt = {"budget_id": "original-tree", "deadline_at": "original-deadline"}
+    events = [{"type": "hermes.receipt", "receipt": receipt},
+              {"type": "hermes.handoff", "receipt": receipt, "source_session_id": child.session_id,
+               "successor_session_id": "paid-successor", "handoff_id": "ho-0123456789abcdef"},
+              {"type": "hermes.result", "result": {"status": "completed", "summary": "Verified",
+                                                     "session_id": "paid-successor"}}]
+    process = SimpleNamespace(stdout=[json.dumps(event) + "\n" for event in events], wait=lambda: 0, poll=lambda: 0)
+    monkeypatch.setattr(delegation_process.subprocess, "Popen", lambda *a, **k: process)
+    result = child.run_entry(0)
+    assert result["status"] == "completed", result
+    assert result["session_id"] == "paid-successor"
+    assert result["source_session_id"] == child.session_id
+    assert child._session_ref["session_id"] == "paid-successor"
+    assert result["receipt"] == receipt
+
+
 @pytest.mark.parametrize("credential_source", ["environment", "helper"])
 def test_real_hermes_worker_emits_usage_and_result_from_local_provider(tmp_path, credential_source):
     requests = []

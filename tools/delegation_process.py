@@ -79,11 +79,12 @@ class ProcessChild:
         self._process = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._session_ref = {"session_id": self.session_id}
         self.tool_progress_callback = _build_child_progress_callback(
             task_index, goal, parent_agent, task_count,
             subagent_id=self._subagent_id, parent_id=self._parent_subagent_id,
             depth=self._delegate_depth - 1, model=self.model,
-            session_ref={"session_id": self.session_id},
+            session_ref=self._session_ref,
         )
         self.directory = get_hermes_home() / "cache" / "delegation" / "paid" / self.session_id
         self.request = {
@@ -177,6 +178,14 @@ class ProcessChild:
                         partial = (partial + str(event.get("text", "")))[-24000:]
                     elif event.get("type") == "hermes.result":
                         result = event["result"]
+                    elif event.get("type") == "hermes.handoff":
+                        if (event.get("source_session_id") != self._session_ref["session_id"]
+                                or event.get("receipt") != receipt or not event.get("successor_session_id")):
+                            raise ValueError("Worker successor identity or original receipt changed")
+                        self._session_ref["session_id"] = event["successor_session_id"]
+                        record["session_id"] = event["successor_session_id"]
+                        self._emit("subagent.handoff", **{key: event[key] for key in
+                            ("source_session_id", "successor_session_id", "handoff_id")})
                     elif event.get("type") == "hermes.progress" and self.tool_progress_callback:
                         self.tool_progress_callback(event["event"], **event.get("data", {}))
                 rc = self._process.wait()
@@ -186,7 +195,8 @@ class ProcessChild:
                 reason = result.get("error") or "Paid worker stopped"
                 result["error"] = f"{reason} (exit {rc}); preserved output: {self.directory}"
             result.update(task_index=task_index, model=self.model, provider=self.provider, tier=self.tier,
-                          session_id=self.session_id, receipt=receipt, output_directory=str(self.directory),
+                          session_id=self._session_ref["session_id"], source_session_id=self.session_id,
+                          receipt=receipt, output_directory=str(self.directory),
                           duration_seconds=round(time.monotonic() - started, 2), _child_role=self.tier)
             result["meter"] = meter
             if meter:
