@@ -17,6 +17,23 @@ class PaidRequestStopped(BaseException):
     """A supervisor denial must stop the worker, not enter model retry loops."""
 
 
+def discover_worker_handoff_tools(toolsets):
+    """Register the admitted handoff tool without loading unrelated MCP servers."""
+    if "mcp-liminal" not in toolsets:
+        return
+    from tools.mcp_tool import _load_mcp_config, register_mcp_servers
+    config = _load_mcp_config().get("liminal")
+    if not config or config.get("enabled", True) is not True:
+        raise PaidRequestStopped("The worker profile has no enabled remote handoff server")
+    # MCP sampling would be an auxiliary model call outside this reservation
+    # adapter. Keep only the existing handoff schema in each worker prompt.
+    scoped = {**config, "sampling": {"enabled": False}, "elicitation": {"enabled": False},
+              "tools": {"include": ["handoff"]}, "connect_timeout": 15, "timeout": 60}
+    registered = register_mcp_servers({"liminal": scoped})
+    if "mcp__liminal__handoff" not in registered:
+        raise PaidRequestStopped("Remote handoff tool discovery failed; no worker inference started")
+
+
 def read_snapshot(path, expected):
     encoded = Path(path).read_bytes()
     if not expected or hashlib.sha256(encoded).hexdigest() != expected:
@@ -206,6 +223,7 @@ def worker_main(request, catalog, emit, verify_snapshot):
     if role == "orchestrator" and "delegation" not in toolsets:
         toolsets.append("delegation")
     toolsets = [name for name in toolsets if name not in {"computer_use", "computer"}]
+    discover_worker_handoff_tools(toolsets)
     prompt = _build_child_system_prompt(
         request["goal"], request["context"], workspace_path=request["workdir"],
         role=role, child_depth=request["depth"], max_spawn_depth=3,

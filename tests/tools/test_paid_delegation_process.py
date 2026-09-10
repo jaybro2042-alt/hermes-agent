@@ -14,6 +14,28 @@ from tools.delegation_process import ProcessChild, select_tier, worker_environme
 from tools.delegation_worker import UsageJournal, RequestReservations, PaidRequestStopped, read_snapshot, resolve_route_runtime
 
 
+def test_worker_discovers_only_handoff_without_sampling(monkeypatch):
+    from tools import mcp_tool
+    from tools.delegation_worker import discover_worker_handoff_tools
+    configs = []
+    monkeypatch.setattr(mcp_tool, "_load_mcp_config", lambda: {
+        "liminal": {"url": "http://127.0.0.1:1/mcp", "enabled": True},
+        "unrelated": {"command": "must-not-launch"}})
+    def register(cfg):
+        configs.append(cfg)
+        return ["mcp__liminal__handoff"]
+    monkeypatch.setattr(mcp_tool, "register_mcp_servers", register)
+    discover_worker_handoff_tools(["file"])
+    assert configs == []
+    discover_worker_handoff_tools(["mcp-liminal"])
+    assert list(configs[0]) == ["liminal"]
+    assert configs[0]["liminal"]["tools"]["include"] == ["handoff"]
+    assert configs[0]["liminal"]["sampling"]["enabled"] is False
+    monkeypatch.setattr(mcp_tool, "register_mcp_servers", lambda cfg: [])
+    with pytest.raises(PaidRequestStopped, match="no worker inference"):
+        discover_worker_handoff_tools(["mcp-liminal"])
+
+
 def test_hierarchy_allows_only_lower_tiers():
     assert select_tier("fast", "director") == "fast"
     assert select_tier("fast", "senior") == "fast"
@@ -152,14 +174,20 @@ def test_native_delegate_builds_proxy_without_inference(tmp_path, monkeypatch):
 
 def test_process_wrapper_reports_verified_successor_identity(tmp_path, monkeypatch):
     from tools import delegation_process
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
     catalog = tmp_path / "routes.json"
     catalog.write_text(json.dumps(_catalog(tmp_path)))
     parent = SimpleNamespace(session_id="director", enabled_toolsets=["file"],
                              _active_children=[], _active_children_lock=threading.Lock())
-    child = ProcessChild(config={"paid_dispatch": {"enabled": True, "catalog_path": str(catalog)}},
-        task_index=0, goal="Finish assigned work", context="Preserve source", parent_agent=parent,
-        role="fast", max_iterations=3, task_count=1)
+    selected_profile = tmp_path / "selected-profile"
+    token = set_hermes_home_override(selected_profile)
+    try:
+        child = ProcessChild(config={"paid_dispatch": {"enabled": True, "catalog_path": str(catalog)}},
+            task_index=0, goal="Finish assigned work", context="Preserve source", parent_agent=parent,
+            role="fast", max_iterations=3, task_count=1)
+    finally:
+        reset_hermes_home_override(token)
     receipt = {"budget_id": "original-tree", "deadline_at": "original-deadline"}
     events = [{"type": "hermes.receipt", "receipt": receipt},
               {"type": "hermes.handoff", "receipt": receipt, "source_session_id": child.session_id,
@@ -167,13 +195,19 @@ def test_process_wrapper_reports_verified_successor_identity(tmp_path, monkeypat
               {"type": "hermes.result", "result": {"status": "completed", "summary": "Verified",
                                                      "session_id": "paid-successor"}}]
     process = SimpleNamespace(stdout=[json.dumps(event) + "\n" for event in events], wait=lambda: 0, poll=lambda: 0)
-    monkeypatch.setattr(delegation_process.subprocess, "Popen", lambda *a, **k: process)
+    launched = []
+    def launch(*args, **kwargs):
+        launched.append(kwargs)
+        return process
+    monkeypatch.setattr(delegation_process.subprocess, "Popen", launch)
     result = child.run_entry(0)
     assert result["status"] == "completed", result
     assert result["session_id"] == "paid-successor"
     assert result["source_session_id"] == child.session_id
     assert child._session_ref["session_id"] == "paid-successor"
     assert result["receipt"] == receipt
+    assert launched[0]["env"]["HERMES_HOME"] == str(selected_profile)
+    assert child.directory.is_relative_to(selected_profile)
 
 
 @pytest.mark.parametrize("credential_source", ["environment", "helper"])

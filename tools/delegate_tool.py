@@ -2830,7 +2830,8 @@ def delegate_task(
     from tools.delegation_process import paid_config, select_tier
     if paid_config(_load_config()) and not role:
         try:
-            top_role = select_tier(None, getattr(parent_agent, "_dispatch_tier", "director"))
+            top_role = select_tier(paid_config(_load_config()).get("default_tier"),
+                                   getattr(parent_agent, "_dispatch_tier", "director"))
         except ValueError as exc:
             return tool_error(str(exc))
     else:
@@ -3858,15 +3859,18 @@ def _build_dynamic_schema_overrides() -> dict:
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
 
-    from tools.delegation_process import paid_config
+    from tools.delegation_process import paid_config, catalog_for
     if paid_config(_load_config()):
         import copy
         overrides_params = copy.deepcopy(overrides_params)
         tiers = ["senior", "medium", "fast"]
-        description = ("Choose a strictly lower tier: senior, medium, or fast. Models are assigned by the "
+        _, catalog = catalog_for(_load_config())
+        if catalog.get("allowed_edges") is not None:
+            tiers = [tier for tier in tiers if any(tier in children for children in catalog["allowed_edges"].values())]
+        description = ("Choose an allowed lower tier: " + ", ".join(tiers) + ". Models are assigned by the "
                        "operator's editable route catalog. Every descendant shares the first worker's "
                        "15-minute deadline and $5 maximum; no automatic renewal. Director coordinates "
-                       "tasks and synthesizes results. Workers can delegate to any lower tier.")
+                       "tasks and synthesizes results. The operator's active graph restricts each worker's children.")
         overrides_params["properties"]["role"].update(enum=tiers, description=description)
         overrides_params["properties"]["tasks"]["items"]["properties"]["role"].update(enum=tiers, description=description)
         return {"description": "Delegate focused work to an isolated paid worker. " + description,

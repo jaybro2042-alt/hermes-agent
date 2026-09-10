@@ -60,7 +60,9 @@ class ProcessChild:
         self.config = config
         self.catalog_path, catalog = catalog_for(config)
         parent_tier = getattr(parent_agent, "_dispatch_tier", "director")
-        self.tier = select_tier(role, parent_tier)
+        self.tier = select_tier(role or paid_config(config).get("default_tier"), parent_tier)
+        if catalog.get("allowed_edges") is not None and self.tier not in catalog["allowed_edges"].get(parent_tier, []):
+            raise ValueError("The operator's active delegation graph does not permit this edge")
         route_id = catalog["defaults"][self.tier]
         route = catalog["routes"][route_id]
         allowed_toolsets = catalog.get("worker_toolsets", ["terminal", "file", "web", "browser", "skills", "delegation", "todo", "session_search"])
@@ -86,7 +88,8 @@ class ProcessChild:
             depth=self._delegate_depth - 1, model=self.model,
             session_ref=self._session_ref,
         )
-        self.directory = get_hermes_home() / "cache" / "delegation" / "paid" / self.session_id
+        self.profile_home = get_hermes_home()
+        self.directory = self.profile_home / "cache" / "delegation" / "paid" / self.session_id
         self.request = {
             "schema_version": 1, "tier": self.tier, "parent_tier": parent_tier,
             "route_id": route_id, "goal": goal, "context": context or "",
@@ -139,6 +142,9 @@ class ProcessChild:
         request_path.chmod(0o600)
         cfg = paid_config(self.config)
         env = worker_environment(os.environ, host_desktop=cfg.get("allow_host_desktop") is True)
+        # Desktop profile selection is a ContextVar, not necessarily os.environ.
+        # The worker must inherit the owner's DB, plugins and MCP configuration.
+        env["HERMES_HOME"] = str(self.profile_home)
         env["PHYSEA_DISPATCH_TIER"] = self.request["parent_tier"]
         env["PHYSEA_SESSION_SOURCE"] = self.request["parent_session_id"] or self.session_id
         env["PHYSEA_DISPATCH_ORIGIN_PID"] = str(os.getpid())
