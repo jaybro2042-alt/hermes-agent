@@ -88,8 +88,9 @@ _MAX_MESSAGE_LENGTH = 8000
 # but the token is generated at spawn time and otherwise exists only in the
 # gateway process memory and the sidecar child env (issue #69960). The
 # gateway persists this record once the sidecar passes its /healthz
-# readiness check, and removes it on every stop / failed-start path so a
-# stale record never outlives a dead sidecar.
+# readiness check, and removes it on every stop / failed-start path. The pid
+# is advisory because the gateway may run in a private PID namespace; the
+# authenticated sidecar request remains the cross-namespace liveness check.
 
 _RUNTIME_RECORD_NAME = "photon-sidecar.json"
 
@@ -148,7 +149,7 @@ def _delete_runtime_record() -> None:
 
 
 def _sidecar_pid_alive(pid: Any) -> bool:
-    """Best-effort liveness check for the recorded sidecar pid."""
+    """Best-effort same-namespace liveness check for the recorded sidecar pid."""
     try:
         pid_int = int(pid)
     except (TypeError, ValueError):
@@ -2737,16 +2738,15 @@ async def _standalone_send(
         # the gateway process env otherwise, so cron/`hermes send` would be
         # structurally unable to authenticate.
         record = _read_runtime_record()
-        stale_hint = ""
         if record and record.get("token"):
-            if _sidecar_pid_alive(record.get("pid")):
-                token = str(record["token"])
-                port = _coerce_port(record.get("port"), port)
-            else:
-                stale_hint = (
-                    " A stale sidecar runtime record was found (pid "
-                    f"{record.get('pid')} is not running) — the gateway "
-                    "appears to be down."
+            token = str(record["token"])
+            port = _coerce_port(record.get("port"), port)
+            if not _sidecar_pid_alive(record.get("pid")):
+                logger.debug(
+                    "[photon] recorded sidecar pid %r is not visible; "
+                    "using the authenticated HTTP request as the liveness "
+                    "check because the gateway may use a private PID namespace",
+                    record.get("pid"),
                 )
         if not token:
             return {
@@ -2755,7 +2755,7 @@ async def _standalone_send(
                     "Start the Hermes gateway (which spawns the sidecar and "
                     "records its address under <hermes-home>/runtime/"
                     f"{_RUNTIME_RECORD_NAME}), or set PHOTON_SIDECAR_TOKEN "
-                    "in this process's environment." + stale_hint
+                    "in this process's environment."
                 )
             }
     base = f"http://{_DEFAULT_SIDECAR_BIND}:{port}"

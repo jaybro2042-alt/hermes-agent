@@ -230,3 +230,20 @@ async def test_standalone_send_consumes_record_when_env_missing(
     assert headers["X-Hermes-Sidecar-Token"] == "record-token"
 
 
+@pytest.mark.asyncio
+async def test_standalone_send_accepts_namespaced_pid_when_sidecar_authenticates(
+    monkeypatch: pytest.MonkeyPatch, record_path: Path
+) -> None:
+    monkeypatch.delenv("PHOTON_SIDECAR_TOKEN", raising=False)
+    photon_adapter._write_runtime_record(9111, "record-token", 4242)
+    monkeypatch.setattr(photon_adapter, "_sidecar_pid_alive", lambda _pid: False)
+    _SendClient.calls = []
+    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _SendClient)
+
+    result = await photon_adapter._standalone_send(
+        PlatformConfig(enabled=True, token="", extra={}), "+15551234567", "hi"
+    )
+
+    assert result == {"success": True, "message_id": "m1"}
+    assert _SendClient.calls[0][2]["X-Hermes-Sidecar-Token"] == "record-token"
+
