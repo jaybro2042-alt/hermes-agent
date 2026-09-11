@@ -756,6 +756,13 @@ class PhotonAdapter(BasePlatformAdapter):
         )
         # A non-positive interval disables the watchdog entirely (escape hatch).
         self._probe_enabled = self._probe_interval > 0
+        self._poll_confirmation_timeout = _coerce_float(
+            _first_set(
+                extra.get("poll_confirmation_timeout_seconds"),
+                os.getenv("PHOTON_POLL_CONFIRMATION_TIMEOUT_SECONDS"),
+            ),
+            8.0,
+        )
 
         # With markdown on, format_message preserves fences and the sidecar's
         # markdown() builder renders them (or degrades them readably).
@@ -795,6 +802,11 @@ class PhotonAdapter(BasePlatformAdapter):
         self._recent_richlinks_by_chat: Dict[str, float] = {}
         # Last time we sent a typing indicator per chat, for cooldown gating.
         self._typing_last_sent: Dict[str, float] = {}
+        # Native poll submission is only transport acceptance. The Spectrum
+        # stream must echo the same message id with a valid title/options before
+        # Hermes treats the prompt as visible and starts capturing replies.
+        self._poll_confirmation_waiters: Dict[str, asyncio.Future] = {}
+        self._poll_confirmation_echoes: Dict[str, tuple[float, Dict[str, Any]]] = {}
 
         self._pending_fffc: Dict[str, tuple[float, Any]] = {}  # chat_key → (timestamp, asyncio.Task)
 
@@ -1239,6 +1251,9 @@ class PhotonAdapter(BasePlatformAdapter):
             )
 
         ctype = content.get("type")
+        if ctype == "poll":
+            self._record_poll_confirmation(event)
+            return
         if ctype == "reaction":
             # Route only tapbacks on messages WE sent — those are implicitly
             # addressed to the bot (feishu precedent: synthetic text event).
@@ -1330,6 +1345,31 @@ class PhotonAdapter(BasePlatformAdapter):
             choice = (content.get("title") or "").strip()
             if not choice:
                 logger.debug("[photon] ignoring poll vote with empty title")
+                return
+            poll_guid = str(content.get("pollGuid") or "").strip()
+            if not poll_guid:
+                logger.warning("[photon] ignoring uncorrelated poll vote without poll GUID")
+                return
+            try:
+                from tools import clarify_gateway as clarify_state
+
+                pending_poll = clarify_state.get_pending_for_poll(
+                    platform="photon",
+                    chat_id=space_id,
+                    poll_guid=poll_guid,
+                )
+            except Exception:
+                logger.warning(
+                    "[photon] failed to correlate poll vote %s",
+                    poll_guid,
+                    exc_info=True,
+                )
+                return
+            if pending_poll is None:
+                logger.warning(
+                    "[photon] ignoring stale or unrelated poll vote for %s",
+                    poll_guid,
+                )
                 return
             source = self.build_source(
                 chat_id=space_id,
@@ -1948,31 +1988,159 @@ class PhotonAdapter(BasePlatformAdapter):
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        if not choices:
-            # No choices → open-ended. Base behaviour (plain text; the next
-            # message resolves it) is exactly right.
-            return await super().send_clarify(
-                chat_id, question, choices, clarify_id, session_key, metadata
-            )
-        # The poll vote comes back as a normal text message, so enable
-        # text-capture and let the gateway intercept resolve the clarify.
-        from tools.clarify_gateway import mark_awaiting_text
+        from tools import clarify_gateway as clarify_state
 
-        mark_awaiting_text(clarify_id)
+        if not choices:
+            return await self.send_clarify_text_fallback(
+                chat_id=chat_id,
+                question=question,
+                choices=choices,
+                clarify_id=clarify_id,
+                session_key=session_key,
+                metadata=metadata,
+            )
         result = await self._sidecar_send_poll(chat_id, question, list(choices))
-        if not result.success:
-            # Native poll failed (old sidecar without /send-poll, or a send
-            # error) — fall back to the numbered-text clarify so the user can
-            # still answer. The base impl also calls mark_awaiting_text (a
-            # second call is harmless).
-            logger.warning(
-                "[photon] poll clarify failed (%s); falling back to text list",
-                result.error,
+        confirmation_error = result.error or "native poll send failed"
+        if result.success and result.message_id:
+            if clarify_state.mark_transport_accepted(clarify_id, result.message_id):
+                confirmed, confirmation_error = await self._wait_for_poll_confirmation(
+                    result.message_id,
+                    expected_title=question,
+                    expected_options=list(choices),
+                )
+                if confirmed and clarify_state.mark_delivery_confirmed(
+                    clarify_id, "native_poll"
+                ):
+                    return SendResult(
+                        success=True,
+                        message_id=result.message_id,
+                        raw_response={"clarify_delivery_channel": "native_poll"},
+                    )
+        elif result.success:
+            confirmation_error = "native poll transport returned no message id"
+
+        logger.warning(
+            "[photon] poll clarify was not confirmed (%s); falling back to text list",
+            confirmation_error,
+        )
+        if not clarify_state.claim_text_fallback(clarify_id):
+            clarify_state.mark_failed(
+                clarify_id,
+                f"text fallback already attempted after: {confirmation_error}",
             )
-            return await super().send_clarify(
-                chat_id, question, choices, clarify_id, session_key, metadata
+            return SendResult(
+                success=False,
+                error="clarification fallback was already attempted",
             )
-        return result
+        fallback = await self.send_clarify_text_fallback(
+            chat_id=chat_id,
+            question=question,
+            choices=choices,
+            clarify_id=clarify_id,
+            session_key=session_key,
+            metadata=metadata,
+            recovery_prefix=(
+                "⚠️ Native poll delivery could not be verified. If a poll "
+                "appeared, ignore it and reply to this numbered version."
+                if result.success and result.message_id
+                else None
+            ),
+        )
+        if not fallback.success:
+            clarify_state.mark_failed(
+                clarify_id,
+                fallback.error or confirmation_error,
+            )
+            return fallback
+        fallback.raw_response = {
+            "clarify_delivery_channel": "numbered_text",
+            "native_poll_error": confirmation_error,
+        }
+        return fallback
+
+    def _record_poll_confirmation(self, event: Dict[str, Any]) -> None:
+        message_id = str(event.get("messageId") or "")
+        if not message_id:
+            return
+        content = event.get("content") or {}
+        now = time.monotonic()
+        waiter = self._poll_confirmation_waiters.get(message_id)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(dict(content))
+        else:
+            space_id = str((event.get("space") or {}).get("id") or "")
+            try:
+                from tools import clarify_gateway as clarify_state
+
+                entry = clarify_state.get_pending_for_poll(
+                    platform="photon",
+                    chat_id=space_id,
+                    poll_guid=message_id,
+                    require_confirmed=False,
+                )
+            except Exception:
+                entry = None
+            if entry is not None and entry.fallback_attempted:
+                logger.warning(
+                    "[photon] native poll %s confirmed after numbered fallback; "
+                    "the labelled numbered prompt remains authoritative",
+                    message_id,
+                )
+                return
+            self._poll_confirmation_echoes[message_id] = (now, dict(content))
+        cutoff = now - 60.0
+        for old_id, (seen_at, _) in list(self._poll_confirmation_echoes.items()):
+            if seen_at < cutoff:
+                self._poll_confirmation_echoes.pop(old_id, None)
+
+    async def _wait_for_poll_confirmation(
+        self,
+        message_id: str,
+        *,
+        expected_title: str,
+        expected_options: List[str],
+    ) -> tuple[bool, str]:
+        cached = self._poll_confirmation_echoes.pop(message_id, None)
+        if cached is not None:
+            return self._validate_poll_confirmation(
+                cached[1], expected_title, expected_options
+            )
+
+        loop = asyncio.get_running_loop()
+        waiter = loop.create_future()
+        self._poll_confirmation_waiters[message_id] = waiter
+        cached = self._poll_confirmation_echoes.pop(message_id, None)
+        if cached is not None and not waiter.done():
+            waiter.set_result(cached[1])
+        timeout = max(0.05, float(self._poll_confirmation_timeout))
+        try:
+            content = await asyncio.wait_for(waiter, timeout=timeout)
+        except asyncio.TimeoutError:
+            return False, f"no correlated Spectrum poll event within {timeout:.2f}s"
+        finally:
+            self._poll_confirmation_waiters.pop(message_id, None)
+        return self._validate_poll_confirmation(
+            content, expected_title, expected_options
+        )
+
+    @staticmethod
+    def _validate_poll_confirmation(
+        content: Dict[str, Any],
+        expected_title: str,
+        expected_options: List[str],
+    ) -> tuple[bool, str]:
+        actual_title = str(content.get("title") or "").strip()
+        actual_options = [
+            str(option).strip()
+            for option in (content.get("options") or [])
+        ]
+        if not actual_title:
+            return False, "correlated Spectrum poll event had an empty title"
+        if actual_title != str(expected_title).strip():
+            return False, "correlated Spectrum poll event title did not match"
+        if actual_options != [str(option).strip() for option in expected_options]:
+            return False, "correlated Spectrum poll event options did not match"
+        return True, ""
 
     # -- Outbound media (parity with the BlueBubbles iMessage channel) -----
     #

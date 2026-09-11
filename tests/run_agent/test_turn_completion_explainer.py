@@ -17,12 +17,14 @@ suite (we patch ``run_agent.OpenAI`` and drive ``agent.client``), so they
 pass identically in CI and locally.
 """
 
+import errno
 import os
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from run_agent import AIAgent
+from hermes_state import CompressionSessionBusyError, SessionCompressionInProgressError
+from run_agent import AIAgent, _classify_session_persistence_error
 
 
 # --------------------------------------------------------------------------
@@ -87,6 +89,26 @@ def test_explanation_for_max_iterations_reached_prefix_match():
         "max_iterations_reached(10/10)"
     )
     assert "iteration" in out.lower()
+
+
+def test_session_persistence_causes_are_typed_without_false_disk_guidance():
+    cases = [
+        (SessionCompressionInProgressError("compressing"), "compression_busy"),
+        (CompressionSessionBusyError("lease changed"), "compression_lease_lost"),
+        (RuntimeError("database is locked"), "database_busy"),
+        (OSError(errno.ENOSPC, "No space left on device"), "disk_full"),
+        (PermissionError("readonly database"), "permission_denied"),
+        (RuntimeError("database disk image is malformed"), "database_corrupt"),
+    ]
+
+    for error, expected_kind in cases:
+        assert _classify_session_persistence_error(error) == expected_kind
+        explanation = AIAgent._format_turn_completion_explanation(
+            "session_persistence_failed", expected_kind
+        )
+        assert explanation
+        if expected_kind not in {"disk_full", "permission_denied"}:
+            assert "free disk space and try again" not in explanation.lower()
 
 
 
@@ -169,5 +191,4 @@ def test_run_conversation_partial_stream_recovery_surfaces_explanation():
     assert result["final_response"].startswith(recovered)
     assert "No reply:" in result["final_response"]
     assert result["response_previewed"] is False
-
 

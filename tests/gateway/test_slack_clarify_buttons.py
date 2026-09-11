@@ -202,6 +202,7 @@ class TestSlackClarifyOtherFlow:
         adapter = _make_adapter()
         _attach_auth_runner(adapter)
         cm.register("cidO", "sk-other", "Pick", ["x", "y"])
+        assert cm.mark_delivery_confirmed("cidO", "native_buttons") is True
         adapter._clarify_resolved["4.4"] = False
 
         mock_client = adapter._team_clients["T1"]
@@ -263,6 +264,9 @@ class TestBaseAdapterClarifyFallbackUnchanged:
             async def get_chat_info(self, *a, **k): return {}
 
         adapter = _Stub()
+        from tools import clarify_gateway as cm
+
+        cm.register("x", "s", "Pick a fruit", ["apple", "banana"])
         result = await adapter.send_clarify(
             chat_id="c", question="Pick a fruit",
             choices=["apple", "banana"], clarify_id="x", session_key="s",

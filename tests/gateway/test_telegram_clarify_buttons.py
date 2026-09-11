@@ -152,6 +152,7 @@ class TestTelegramClarifyCallback:
         adapter = _make_adapter()
         # Pre-register a clarify entry so the callback can look up the choice text
         cm.register("cidA", "sk-cb", "Pick", ["red", "green", "blue"])
+        assert cm.mark_delivery_confirmed("cidA", "native_buttons") is True
         adapter._clarify_state["cidA"] = "sk-cb"
 
         query = AsyncMock()
@@ -263,6 +264,9 @@ class TestBaseAdapterClarifyFallback:
             async def get_chat_info(self, *a, **k): return {}
 
         adapter = _Stub()
+        from tools import clarify_gateway as cm
+
+        cm.register("x", "s", "Pick a fruit", ["apple", "banana"])
 
         result = await adapter.send_clarify(
             chat_id="c",
@@ -277,4 +281,3 @@ class TestBaseAdapterClarifyFallback:
         assert "Pick a fruit" in text
         assert "1." in text and "apple" in text
         assert "2." in text and "banana" in text
-

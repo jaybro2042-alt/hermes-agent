@@ -521,7 +521,11 @@ def finalize_turn(
                     or _is_partial_stream_recovery
                 ):
                     _explanation = agent._format_turn_completion_explanation(
-                        _turn_exit_reason
+                        _turn_exit_reason,
+                        (
+                            getattr(agent, "_last_session_persistence_failure", None)
+                            or {}
+                        ).get("kind"),
                     )
                     if _explanation:
                         if _is_empty_terminal:
@@ -670,8 +674,13 @@ def finalize_turn(
     # (and desktop can toast disk-full) instead of a quiet complete frame.
     if failed and str(_turn_exit_reason) == "session_persistence_failed":
         result["error"] = final_response or (
-            "session storage could not be written — free disk space and try again"
+            "session storage could not be written — inspect the typed persistence cause and retry"
         )
+        persistence_failure = getattr(
+            agent, "_last_session_persistence_failure", None
+        )
+        if isinstance(persistence_failure, dict):
+            result["persistence_failure"] = dict(persistence_failure)
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

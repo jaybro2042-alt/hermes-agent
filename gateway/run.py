@@ -3274,6 +3274,18 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     return True
 
 
+def _clarify_delivery_channel_from_result(result: Any, has_choices: bool) -> str:
+    """Resolve an adapter-reported clarify channel without stringifying None."""
+    default_channel = "adapter" if has_choices else "open_text"
+    raw_response = getattr(result, "raw_response", None)
+    reported_channel = (
+        raw_response.get("clarify_delivery_channel")
+        if isinstance(raw_response, dict)
+        else None
+    )
+    return str(reported_channel or default_channel)
+
+
 def _preserve_queued_followup_history_offset(
     current_result: dict,
     followup_result: dict,
@@ -4671,12 +4683,24 @@ class TurnRunner:
                 return ""
 
             clarify_id = _uuid.uuid4().hex[:10]
+            timeout = _clarify_mod.get_clarify_timeout()
+            expires_at = (
+                None
+                if timeout is None or float(timeout) <= 0
+                else time.time() + float(timeout)
+            )
             _clarify_mod.register(
                 clarify_id=clarify_id,
                 session_key=ctx.session_key or "",
                 question=question,
                 choices=list(choices) if choices else None,
                 multi_select=bool(multi_select),
+                platform=str(
+                    getattr(ctx.source.platform, "value", ctx.source.platform) or ""
+                ),
+                chat_id=str(ctx._status_chat_id or ""),
+                thread_id=(ctx._status_thread_metadata or {}).get("thread_id"),
+                expires_at=expires_at,
             )
 
             # Pause typing — like approval, we don't want a "thinking..."
@@ -4727,6 +4751,14 @@ class TurnRunner:
                 try:
                     result = fut.result(timeout=15)
                     send_ok = bool(getattr(result, "success", False))
+                    if send_ok:
+                        send_ok = _clarify_mod.mark_delivery_confirmed(
+                            clarify_id,
+                            _clarify_delivery_channel_from_result(
+                                result,
+                                bool(choices),
+                            ),
+                        )
                 except Exception as exc:
                     logger.warning("Clarify send failed: %s", exc)
                     send_ok = False
@@ -4738,10 +4770,11 @@ class TurnRunner:
                 _clarify_mod.clear_session(ctx.session_key or "")
                 return "[clarify prompt could not be delivered]"
 
-            timeout = _clarify_mod.get_clarify_timeout()
             response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
             if response is None or response == "":
                 # Timeout or session-boundary cancellation
+                if float(timeout) <= 0:
+                    return "[clarification was cancelled before the user responded]"
                 return f"[user did not respond within {int(timeout / 60)}m]"
             return response
 
@@ -10007,6 +10040,122 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
+    async def _recover_pending_clarifications_for_scope(
+        self,
+        *,
+        adapters: Dict[Platform, BasePlatformAdapter],
+        platform=None,
+    ) -> int:
+        """Restore durable clarifications for the current HERMES_HOME scope."""
+        try:
+            from tools import clarify_gateway as clarify_state
+
+            await asyncio.to_thread(clarify_state.recover_pending)
+            platform_name = (
+                getattr(platform, "value", str(platform)) if platform is not None else None
+            )
+            entries = clarify_state.recovered_entries(
+                platform=platform_name,
+                home_key=str(get_hermes_home()),
+            )
+        except Exception:
+            logger.warning("Clarification recovery failed", exc_info=True)
+            return 0
+
+        delivered = 0
+        for entry in entries:
+            if not entry.needs_recovery_fallback:
+                continue
+            try:
+                entry_platform = Platform(entry.platform)
+            except Exception:
+                clarify_state.mark_failed(
+                    entry.clarify_id,
+                    f"unknown clarification platform: {entry.platform!r}",
+                )
+                continue
+            adapter = adapters.get(entry_platform)
+            if adapter is None:
+                continue
+            if not clarify_state.claim_text_fallback(entry.clarify_id):
+                continue
+            metadata = {"thread_id": entry.thread_id} if entry.thread_id else None
+            try:
+                result = await adapter.send_clarify_text_fallback(
+                    chat_id=entry.chat_id,
+                    question=entry.question,
+                    choices=entry.choices,
+                    clarify_id=entry.clarify_id,
+                    session_key=entry.session_key,
+                    metadata=metadata,
+                    recovery_prefix=(
+                        "♻️ Recovered clarification — the gateway restarted. "
+                        "Previous buttons or polls may no longer work; reply to "
+                        "this numbered version once."
+                    ),
+                )
+            except Exception as exc:
+                result = None
+                clarify_state.mark_failed(entry.clarify_id, str(exc))
+            if result is not None and getattr(result, "success", False):
+                delivered += 1
+                logger.info(
+                    "Recovered clarification %s as numbered text for %s:%s",
+                    entry.clarify_id,
+                    entry.platform,
+                    entry.chat_id,
+                )
+            elif result is not None:
+                clarify_state.mark_failed(
+                    entry.clarify_id,
+                    str(getattr(result, "error", "") or "recovery send failed"),
+                )
+        return delivered
+
+    async def _recover_pending_clarifications(
+        self,
+        platform=None,
+        *,
+        profile_name: Optional[str] = None,
+    ) -> int:
+        """Restore clarifications in every served profile without cross-routing."""
+        if not getattr(self.config, "multiplex_profiles", False):
+            return await self._recover_pending_clarifications_for_scope(
+                adapters=self.adapters,
+                platform=platform,
+            )
+
+        try:
+            from hermes_cli.profiles import (
+                get_active_profile_name,
+                profiles_to_serve,
+            )
+
+            active = get_active_profile_name() or "default"
+            profiles = list(profiles_to_serve(multiplex=True))
+        except Exception:
+            logger.warning(
+                "Could not enumerate multiplex profiles for clarification recovery",
+                exc_info=True,
+            )
+            return 0
+
+        delivered = 0
+        for current_name, profile_home in profiles:
+            if profile_name is not None and current_name != profile_name:
+                continue
+            adapters = (
+                self.adapters
+                if current_name == active
+                else self._profile_adapters.get(current_name, {})
+            )
+            with _profile_runtime_scope(profile_home):
+                delivered += await self._recover_pending_clarifications_for_scope(
+                    adapters=adapters,
+                    platform=platform,
+                )
+        return delivered
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -10034,10 +10183,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
+                try:
+                    from tools.clarify_gateway import has_pending as _has_pending_clarify
+                except Exception:
+                    _has_pending_clarify = lambda _session_key: False
                 candidates = [
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
                     if entry.resume_pending
                     and not entry.suspended
+                    and not _has_pending_clarify(entry.session_key)
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
                     and (platform is None or entry.origin.platform == platform)
@@ -10994,6 +11148,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # in the ledger — redelivering it (and clearing resume_pending for
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
+        await self._recover_pending_clarifications()
         await self._redeliver_pending_obligations()
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
@@ -11788,6 +11943,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # auto-resume scoped to this platform so recovery
                         # doesn't silently wait for a manual user message.
                         try:
+                            await self._recover_pending_clarifications(platform=platform)
                             self._schedule_resume_pending_sessions(platform=platform)
                         except Exception:
                             logger.debug(
@@ -12738,6 +12894,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "✓ %s reconnected (profile: %s)",
                                 platform.value,
                                 profile_name,
+                            )
+                            await self._recover_pending_clarifications(
+                                platform=platform,
+                                profile_name=profile_name,
                             )
                             return
                         # A newer reconnect already won the slot while this
@@ -13875,10 +14035,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # so the user can retry; if it times out, the agent unblocks
             # with an empty response.
             if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
-                _resolved = _clarify_mod.resolve_text_response_for_session(
+                _resolved_entry = _clarify_mod.resolve_text_response_for_session_with_entry(
                     _quick_key, _raw_clarify_reply,
                 )
-                if _resolved:
+                if _resolved_entry is not None:
                     logger.info(
                         "Gateway intercepted clarify text response (session=%s, id=%s)",
                         _quick_key, _pending_clarify.clarify_id,
@@ -13898,10 +14058,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Failed to resume typing after clarify response",
                                 exc_info=True,
                             )
-                    # Acknowledge with empty string so adapters that emit
-                    # the agent's response don't double-post.  The agent
-                    # itself will produce the next user-facing message.
-                    return ""
+                    if _resolved_entry.recovered:
+                        setattr(
+                            event,
+                            "_clarify_recovery_note",
+                            _clarify_mod.recovered_answer_note(_resolved_entry),
+                        )
+                    else:
+                        # Acknowledge with empty string so adapters that emit
+                        # the agent's response don't double-post.  The agent
+                        # itself will produce the next user-facing message.
+                        return ""
 
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
@@ -15655,6 +15822,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or _was_auto_reset
             or getattr(session_entry, "is_fresh_reset", False)
         )
+        _was_fresh_reset = bool(getattr(session_entry, "is_fresh_reset", False))
         # Consume the is_fresh_reset flag immediately so it doesn't leak
         # onto subsequent messages in the same session (issue #6508).
         if getattr(session_entry, "is_fresh_reset", False):
@@ -15718,12 +15886,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # None (appends nothing) for other platforms or when there's no prior
             # activity to recall.  Deterministic — no extra API/DB calls (#36220).
             try:
-                continuity_note = build_channel_continuity_note(session_entry, source)
+                continuity_note = build_channel_continuity_note(
+                    session_entry,
+                    source,
+                    fresh_reset=_was_fresh_reset,
+                )
             except Exception:
                 continuity_note = None
             if continuity_note:
                 context_note = context_note + "\n\n" + continuity_note
             turn_sidecar_notes.append(context_note)
+
+        elif _was_fresh_reset:
+            try:
+                continuity_note = build_channel_continuity_note(
+                    session_entry,
+                    source,
+                    fresh_reset=True,
+                )
+            except Exception:
+                continuity_note = None
+            if continuity_note:
+                turn_sidecar_notes.append(continuity_note)
 
             # Send a user-facing notification explaining the reset, unless:
             # - notifications are disabled in config
@@ -16661,6 +16845,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text = _clean_message_text
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
+
+        _clarify_recovery_note = getattr(event, "_clarify_recovery_note", None)
+        if _clarify_recovery_note:
+            turn_sidecar_notes.append(str(_clarify_recovery_note))
 
         # Stage the collected must-deliver notes for this turn's agent run
         # (one-shot; consumed in run_sync).  Staged AFTER the message_text

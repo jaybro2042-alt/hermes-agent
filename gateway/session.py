@@ -948,8 +948,10 @@ class SessionEntry:
 def build_channel_continuity_note(
     entry: "SessionEntry",
     source: SessionSource,
+    *,
+    fresh_reset: bool = False,
 ) -> Optional[str]:
-    """Build a lightweight session-continuity hint for Slack/Discord channels.
+    """Build an exact predecessor hint for reset messaging sessions.
 
     Slack and Discord channels/threads are long-lived: when the daily/idle
     reset policy starts a fresh session, the agent loses the thread's prior
@@ -958,26 +960,37 @@ def build_channel_continuity_note(
     specific prior session in *this* channel/thread so it recalls that
     context via ``session_search`` before acting.
 
-    Returns ``None`` (and the caller adds nothing) unless **all** hold:
-      - the source platform is Slack or Discord,
-      - this session was created by an auto-reset that had real activity,
-      - the previous session_id was recorded on the entry.
+    Slack/Discord retain their auto-reset-only behavior. Photon also receives
+    the exact predecessor after an explicit reset so the Director searches that
+    session before any broad same-user history lookup.
 
     No LLM calls, no extra API/DB lookups — the previous session id is
     already known from :meth:`SessionStore.get_or_create_session`.
     """
-    if source.platform not in (Platform.SLACK, Platform.DISCORD):
-        return None
-    if not getattr(entry, "reset_had_activity", False):
-        return None
     prev = getattr(entry, "prev_session_id", None)
     if not prev:
         return None
 
-    where = "thread" if source.thread_id else "channel"
+    platform_name = getattr(source.platform, "value", str(source.platform))
+    is_channel_platform = source.platform in (Platform.SLACK, Platform.DISCORD)
+    is_photon = platform_name == "photon"
+    if is_channel_platform:
+        if not getattr(entry, "reset_had_activity", False):
+            return None
+    elif is_photon:
+        if not (fresh_reset or getattr(entry, "was_auto_reset", False)):
+            return None
+    else:
+        return None
+
+    where = (
+        "conversation"
+        if is_photon
+        else ("thread" if source.thread_id else "channel")
+    )
     return (
         f"[System note: This {where} had an earlier Hermes session "
-        f"(session_id: {prev}) that was auto-reset. If the user refers to "
+        f"(session_id: {prev}) that was reset. If the user refers to "
         f"earlier work here, or the request depends on this {where}'s history, "
         f"use the session_search tool to recall that prior session before "
         f"acting — do not assume an unrelated recent session is the right "
@@ -2744,6 +2757,7 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
+                prev_session_id=old_entry.session_id,
             )
 
             self._entries[session_key] = new_entry

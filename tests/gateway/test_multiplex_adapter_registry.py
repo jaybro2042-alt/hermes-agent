@@ -96,6 +96,63 @@ class TestProfileMessageHandler:
         assert seen["profile"] == "coder"
 
 
+@pytest.mark.asyncio
+async def test_clarification_recovery_scans_each_profile_with_its_adapter_map(
+    monkeypatch,
+    tmp_path,
+):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    default_adapter = object()
+    reviewer_adapter = object()
+    runner.adapters = {Platform.DISCORD: default_adapter}
+    runner._profile_adapters = {
+        "reviewer": {Platform.DISCORD: reviewer_adapter},
+    }
+    default_home = tmp_path / "default"
+    reviewer_home = tmp_path / "reviewer"
+    default_home.mkdir()
+    reviewer_home.mkdir()
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name",
+        lambda: "default",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: [
+            ("default", default_home),
+            ("reviewer", reviewer_home),
+        ],
+    )
+    calls = []
+
+    async def fake_recover(*, adapters, platform=None):
+        from hermes_constants import get_hermes_home
+
+        calls.append((Path(get_hermes_home()), adapters, platform))
+        return 1
+
+    monkeypatch.setattr(
+        runner,
+        "_recover_pending_clarifications_for_scope",
+        fake_recover,
+    )
+
+    recovered = await runner._recover_pending_clarifications(
+        platform=Platform.DISCORD
+    )
+
+    assert recovered == 2
+    assert calls == [
+        (default_home, runner.adapters, Platform.DISCORD),
+        (
+            reviewer_home,
+            runner._profile_adapters["reviewer"],
+            Platform.DISCORD,
+        ),
+    ]
+
+
 class _SecondaryRecoveryAdapter:
     platform = Platform.DISCORD
 
@@ -493,5 +550,4 @@ class TestFeishuPortBindingConditional:
 
         connected = await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
         assert connected == 0  # no error, just nothing connected
-
 

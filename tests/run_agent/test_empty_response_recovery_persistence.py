@@ -1,5 +1,7 @@
 """Regression tests for empty-response recovery transcript persistence."""
 
+import errno
+
 from run_agent import AIAgent
 
 
@@ -23,6 +25,18 @@ def _agent_with_capturing_db():
     agent._last_flushed_db_idx = 0
     agent.session_id = "sess-test"
     return agent
+
+
+class _FailOnceSessionDB(_CapturingSessionDB):
+    def __init__(self):
+        super().__init__()
+        self.attempts = 0
+
+    def append_message(self, session_id, role, content=None, **kwargs):
+        self.attempts += 1
+        if self.attempts == 1:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return super().append_message(session_id, role, content, **kwargs)
 
 
 def _agent_with_stubbed_persistence():
@@ -96,6 +110,21 @@ def test_persist_session_keeps_unmarked_terminal_empty_response():
         {"role": "assistant", "content": "(empty)"},
     ]
     assert agent.flushed_session_db_messages[-1] == messages
+
+
+def test_successful_retry_preserves_first_turn_persistence_failure_cause():
+    agent = _agent_with_capturing_db()
+    agent._session_db = _FailOnceSessionDB()
+    agent._last_session_persistence_failure = None
+    message = {"role": "user", "content": "save this"}
+
+    assert agent._flush_messages_to_session_db([message], []) is False
+    assert agent._flush_messages_to_session_db([message], []) is True
+
+    assert agent._last_session_persistence_failure == {
+        "kind": "disk_full",
+        "message": "[Errno 28] No space left on device",
+    }
 
 
 

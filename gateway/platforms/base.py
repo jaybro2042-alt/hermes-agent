@@ -3796,6 +3796,26 @@ class BasePlatformAdapter(ABC):
         Adapters with native button UIs (Telegram, Discord) SHOULD
         override this for a richer UX.
         """
+        return await self.send_clarify_text_fallback(
+            chat_id=chat_id,
+            question=question,
+            choices=choices,
+            clarify_id=clarify_id,
+            session_key=session_key,
+            metadata=metadata,
+        )
+
+    async def send_clarify_text_fallback(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        recovery_prefix: Optional[str] = None,
+    ) -> SendResult:
+        """Send the universal text prompt and arm interception after success."""
         if choices:
             # Multi-select clarifies register their flag on the pending entry;
             # look it up by id so the signature stays adapter-compatible.
@@ -3820,17 +3840,33 @@ class BasePlatformAdapter(ABC):
             else:
                 lines.append("Reply with the number, the option text, or your own answer.")
             text = "\n".join(lines)
-            # Text fallback: enable text-capture so the gateway intercept
-            # picks up the user's typed reply (e.g. "2" or choice text).
-            from tools.clarify_gateway import mark_awaiting_text
-            mark_awaiting_text(clarify_id)
         else:
             text = f"❓ {question}"
-        return await self.send(
+        if recovery_prefix:
+            text = f"{recovery_prefix.rstrip()}\n\n{text}"
+        result = await self.send(
             chat_id=chat_id,
             content=text,
             metadata=metadata,
         )
+        if result.success:
+            from tools.clarify_gateway import mark_delivery_confirmed
+
+            delivery_channel = "numbered_text" if choices else "open_text"
+            if not mark_delivery_confirmed(clarify_id, delivery_channel):
+                return SendResult(
+                    success=False,
+                    error="clarification prompt was sent but its durable state could not be confirmed",
+                    raw_response={"message_id": result.message_id},
+                )
+            raw_response = (
+                dict(result.raw_response)
+                if isinstance(result.raw_response, dict)
+                else {}
+            )
+            raw_response["clarify_delivery_channel"] = delivery_channel
+            result.raw_response = raw_response
+        return result
 
     async def send_private_notice(
         self,

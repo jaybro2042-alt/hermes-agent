@@ -118,6 +118,7 @@ async def test_thread_prose_not_swallowed_by_native_multi_choice_clarify():
     runner = _make_runner(adapter)
     # Native interactive multi-choice prompt: awaiting_text stays False.
     entry = cm.register("cl-native", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
+    assert cm.mark_delivery_confirmed("cl-native", "native_buttons") is True
     assert entry.awaiting_text is False
 
     with pytest.raises(_FellThroughIntercept):
@@ -140,6 +141,7 @@ async def test_prose_still_accepted_after_other_flips_text_capture():
     adapter = _StubAdapter()
     runner = _make_runner(adapter)
     cm.register("cl-other", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
+    assert cm.mark_delivery_confirmed("cl-other", "native_buttons") is True
     assert cm.mark_awaiting_text("cl-other") is True
 
     result = await _dispatch(runner, _event("a carousel actually"))
@@ -151,5 +153,4 @@ async def test_prose_still_accepted_after_other_flips_text_capture():
     assert entry.event.is_set()
     assert entry.response == "a carousel actually"
     _clear_clarify_state()
-
 

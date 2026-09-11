@@ -617,6 +617,50 @@ async def test_startup_auto_resume_skips_unauthorized_owner():
 
 
 @pytest.mark.asyncio
+async def test_startup_auto_resume_waits_for_recovered_clarification():
+    """A restored prompt owns the next user reply; startup must not also
+    synthesize a competing resume turn for the same session."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="clarify-chat")
+    session_key = runner._session_key_for_source(source)
+    pending_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    from tools import clarify_gateway as clarify_state
+
+    clarify_state.register(
+        "recovered-clarify",
+        session_key,
+        "Which option?",
+        ["A", "B"],
+        platform="telegram",
+        chat_id=source.chat_id,
+    )
+    assert clarify_state.mark_delivery_confirmed(
+        "recovered-clarify", "native_buttons"
+    )
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    clarify_state.clear_session(session_key)
+
+
+@pytest.mark.asyncio
 async def test_reconnect_reschedule_is_platform_scoped():
     """The platform filter limits the pass to that platform's sessions, so
     reconnecting one platform never resumes another's pending session."""
@@ -1038,5 +1082,4 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
 
     never_finishes.set()
     await slow_task
-
 

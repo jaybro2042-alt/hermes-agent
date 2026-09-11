@@ -67,6 +67,8 @@ import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
 import { chooseSendFormat } from "./send-format.mjs";
+import { shouldForwardSpectrumMessage } from "./message-routing.mjs";
+import { pollGuidForOption } from "./poll-correlation.mjs";
 import {
   classifyProbeRejection,
   shouldProbe,
@@ -515,7 +517,7 @@ function reactionTargetText(target) {
     : text;
 }
 
-async function normalizeContent(content) {
+async function normalizeContent(content, messageId = null) {
   if (!content || typeof content !== "object") {
     return { type: "unknown" };
   }
@@ -540,7 +542,7 @@ async function normalizeContent(content) {
     for (const item of Array.isArray(content.items) ? content.items : []) {
       items.push({
         id: item && typeof item === "object" ? item.id ?? null : null,
-        content: await normalizeContent(item?.content),
+        content: await normalizeContent(item?.content, item?.id ?? null),
       });
     }
     return { type: "group", items };
@@ -570,6 +572,7 @@ async function normalizeContent(content) {
       title: content.option?.title ?? content.title ?? "",
       selected: content.selected !== false,
       pollTitle: content.poll?.title ?? null,
+      pollGuid: pollGuidForOption(content, messageId),
     };
   }
   // The poll message itself (its creation) — surfaced for completeness so the
@@ -600,7 +603,7 @@ async function normalizeEvent(space, message) {
         phone: space.phone ?? msgSpace.phone ?? null,
       },
       sender: { id: message.sender ? message.sender.id : null },
-      content: await normalizeContent(message.content),
+      content: await normalizeContent(message.content, message.id ?? null),
       timestamp:
         ts instanceof Date ? ts.toISOString() : ts ? String(ts) : null,
     };
@@ -650,8 +653,10 @@ function inboundStreamErrorMessage(e) {
         markStreamHealthy();
         // Every yield — any direction — proves the inbound stream is live.
         noteInboundYield();
-        // Only forward inbound messages (ignore our own outbound echoes).
-        if (message && message.direction && message.direction !== "inbound") {
+        // Forward inbound messages plus our own outbound poll echo. The latter
+        // is the provider-backed delivery confirmation for clarify polls;
+        // every other outbound echo stays suppressed.
+        if (!shouldForwardSpectrumMessage(message)) {
           continue;
         }
         rememberInboundSpace(space, message);

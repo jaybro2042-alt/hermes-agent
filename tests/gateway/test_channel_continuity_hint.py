@@ -48,6 +48,15 @@ def _slack_source(thread_id=None):
     )
 
 
+def _photon_source():
+    return SessionSource(
+        platform=Platform("photon"),
+        chat_id="+15555550123",
+        chat_type="dm",
+        user_id="+15555550123",
+    )
+
+
 # ---------------------------------------------------------------------------
 # SessionStore records prev_session_id on auto-reset
 # ---------------------------------------------------------------------------
@@ -68,6 +77,24 @@ class TestPrevSessionIdCapture:
         assert entry2.was_auto_reset is True
         assert entry2.reset_had_activity is True
         assert entry2.prev_session_id == entry1.session_id
+
+    def test_manual_photon_reset_preserves_exact_predecessor(
+        self, _isolated_db, tmp_path
+    ):
+        store = _make_store(tmp_path)
+        source = _photon_source()
+        first = store.get_or_create_session(source)
+
+        reset = store.reset_session(first.session_key)
+
+        assert reset is not None
+        assert reset.prev_session_id == first.session_id
+        note = build_channel_continuity_note(reset, source, fresh_reset=True)
+        assert note is not None
+        assert first.session_id in note
+        assert "session_search" in note
+        assert "conversation" in note
+        assert "was reset" in note
 
 
 # ---------------------------------------------------------------------------
@@ -101,4 +128,3 @@ class TestBuildChannelContinuityNote:
     def test_no_activity_returns_none(self):
         entry = _reset_entry(Platform.SLACK, had_activity=False)
         assert build_channel_continuity_note(entry, _slack_source()) is None
-

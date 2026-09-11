@@ -34,6 +34,7 @@ except ModuleNotFoundError:
 import asyncio
 import base64
 import copy
+import errno
 import hashlib
 import json
 import logging
@@ -101,6 +102,39 @@ def _session_source_for_agent(platform: Optional[str]) -> str:
     if source:
         return source
     return platform or "cli"
+
+
+def _classify_session_persistence_error(exc: Exception) -> str:
+    """Return a stable cause code for a failed transcript write."""
+    try:
+        from hermes_state import (
+            CompressionSessionBusyError,
+            SessionCompressionInProgressError,
+        )
+
+        if isinstance(exc, SessionCompressionInProgressError):
+            return "compression_busy"
+        if isinstance(exc, CompressionSessionBusyError):
+            return "compression_lease_lost"
+    except Exception:
+        pass
+    if isinstance(exc, PermissionError):
+        return "permission_denied"
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) in {
+        errno.ENOSPC,
+        getattr(errno, "EDQUOT", errno.ENOSPC),
+    }:
+        return "disk_full"
+    text = str(exc or "").casefold()
+    if "database or disk is full" in text or "no space left on device" in text:
+        return "disk_full"
+    if "permission denied" in text or "readonly database" in text:
+        return "permission_denied"
+    if "database is locked" in text or "another hermes process" in text:
+        return "database_busy"
+    if "malformed" in text or "database disk image is malformed" in text:
+        return "database_corrupt"
+    return "unknown"
 
 
 # OpenAI lazy proxy + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
@@ -2232,6 +2266,11 @@ class AIAgent:
             # Force a full re-scan on the next flush: an exception mid-loop
             # leaves messages with mixed dispositions.
             self._db_flush_scan_prefix = None
+            if getattr(self, "_last_session_persistence_failure", None) is None:
+                self._last_session_persistence_failure = {
+                    "kind": _classify_session_persistence_error(e),
+                    "message": str(e),
+                }
             logger.warning("Session DB append_message failed: %s", e)
             return False
 
@@ -3490,7 +3529,10 @@ class AIAgent:
         return True  # safe default: explainer on
 
     @staticmethod
-    def _format_turn_completion_explanation(turn_exit_reason: str) -> str:
+    def _format_turn_completion_explanation(
+        turn_exit_reason: str,
+        persistence_failure_kind: Optional[str] = None,
+    ) -> str:
         """Render a user-facing explanation for an abnormal turn ending.
 
         Maps the internal ``turn_exit_reason`` to a short, actionable
@@ -3579,12 +3621,50 @@ class AIAgent:
                 "let it summarize."
             )
         if reason == "session_persistence_failed":
+            if persistence_failure_kind == "compression_busy":
+                return (
+                    prefix
+                    + "the turn was deferred because another compression path "
+                    "temporarily owned this session. The database is healthy; "
+                    "send `continue` after compression finishes."
+                )
+            if persistence_failure_kind == "compression_lease_lost":
+                return (
+                    prefix
+                    + "the compression lease changed before the transcript could "
+                    "be committed. Retry the turn; this is not a disk-space or "
+                    "file-permission diagnosis."
+                )
+            if persistence_failure_kind == "database_busy":
+                return (
+                    prefix
+                    + "another Hermes process held the session database beyond "
+                    "the bounded write window. Retry after that writer finishes; "
+                    "the failure does not indicate a full disk."
+                )
+            if persistence_failure_kind == "disk_full":
+                return (
+                    prefix
+                    + "the session database reported that the disk or quota is "
+                    "full. Free space, then send the message again."
+                )
+            if persistence_failure_kind == "permission_denied":
+                return (
+                    prefix
+                    + "the session database reported a permission or read-only "
+                    "filesystem error. Repair the state.db path permissions, then retry."
+                )
+            if persistence_failure_kind == "database_corrupt":
+                return (
+                    prefix
+                    + "SQLite reported database corruption while saving the turn. "
+                    "Preserve state.db and run the documented database recovery path."
+                )
             return (
                 prefix
-                + "the turn was stopped because session storage could not be "
-                "written (the transcript would have been lost on restart). "
-                "This is often a full disk — free some space (or fix state.db "
-                "permissions), then send your message again."
+                + "session storage could not be written, but Hermes could not "
+                "classify the cause. Inspect the persistence error before changing "
+                "disk space or permissions, then retry."
             )
         # Unknown/diagnostic-only reasons (e.g. "unknown", guardrail_halt
         # which already surfaces its own message) — don't second-guess.
@@ -7195,6 +7275,7 @@ class AIAgent:
                 "messages": conversation_history or getattr(self, "_session_messages", []) or [],
                 "completed": False, "interrupted": True, "api_calls": 0,
                 "error": "handoff_source_paused", "successor_session_id": successor}
+        self._last_session_persistence_failure = None
         from agent.aux_accounting import (
             reset_accounting_context,
             set_accounting_context,

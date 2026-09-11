@@ -22,6 +22,10 @@ def _clear_clarify_state():
         cm._notify_cbs.clear()
 
 
+def _confirm(cm, clarify_id: str, channel: str = "native_poll"):
+    assert cm.mark_delivery_confirmed(clarify_id, channel) is True
+
+
 class TestClarifyPrimitive:
     """Core register/wait/resolve mechanics."""
 
@@ -33,6 +37,7 @@ class TestClarifyPrimitive:
         from tools import clarify_gateway as cm
 
         cm.register("id1", "sk1", "Pick one", ["A", "B", "C"])
+        _confirm(cm, "id1")
 
         def resolver():
             time.sleep(0.05)
@@ -42,15 +47,25 @@ class TestClarifyPrimitive:
         result = cm.wait_for_response("id1", timeout=10.0)
         assert result == "B"
 
-    def test_open_ended_auto_awaits_text(self):
-        """Clarify with no choices is in text-capture mode immediately."""
+    def test_fast_native_click_before_confirmation_remains_successful(self):
+        """A button callback is itself proof the prompt was visible."""
+        from tools import clarify_gateway as cm
+
+        cm.register("id1-fast", "sk1-fast", "Pick one", ["A", "B"])
+
+        assert cm.resolve_gateway_clarify("id1-fast", "B") is True
+        assert cm.mark_delivery_confirmed("id1-fast", "adapter") is True
+        assert cm.wait_for_response("id1-fast", timeout=1.0) == "B"
+
+    def test_open_ended_awaits_text_only_after_confirmed_delivery(self):
+        """An undelivered prompt cannot consume an unrelated inbound message."""
         from tools import clarify_gateway as cm
 
         entry = cm.register("id2", "sk2", "Free form?", None)
-        assert entry.awaiting_text is True
+        assert entry.awaiting_text is False
+        assert cm.get_pending_for_session("sk2") is None
 
-        # get_pending_for_session returns the entry so the gateway
-        # text-intercept can find it.
+        _confirm(cm, "id2", "open_text")
         pending = cm.get_pending_for_session("sk2")
         assert pending is not None
         assert pending.clarify_id == "id2"
@@ -68,6 +83,7 @@ class TestClarifyPrimitive:
         from tools import clarify_gateway as cm
 
         cm.register("id3b", "sk3b", "Pick", ["X", "Y"])
+        _confirm(cm, "id3b")
         pending = cm.get_pending_for_session("sk3b", include_choice_prompts=True)
         assert pending is not None
         assert pending.clarify_id == "id3b"
@@ -90,6 +106,60 @@ class TestClarifyPrimitive:
             result = fut.result(timeout=10.0)
             # clear_session sets response="" then the wait returns it
             assert result == ""
+
+    def test_clear_session_preserves_answer_accepted_concurrently(self, monkeypatch):
+        """Session cleanup cannot replace an accepted answer with cancellation."""
+        from tools import clarify_gateway as cm
+
+        entry = cm.register("id7-race", "sk7-race", "Q?", ["A", "B"])
+        _confirm(cm, "id7-race")
+        entered = threading.Event()
+        release = threading.Event()
+        original = cm._persist_transition
+
+        def slow_answer(*args, **kwargs):
+            if kwargs.get("state") == cm.STATE_ANSWERED:
+                entered.set()
+                assert release.wait(timeout=5)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(cm, "_persist_transition", slow_answer)
+        resolver = threading.Thread(
+            target=lambda: cm.resolve_gateway_clarify("id7-race", "B")
+        )
+        resolver.start()
+        assert entered.wait(timeout=5)
+        clearer = threading.Thread(target=lambda: cm.clear_session("sk7-race"))
+        clearer.start()
+        time.sleep(0.05)
+        assert clearer.is_alive()
+        release.set()
+        resolver.join(timeout=5)
+        clearer.join(timeout=5)
+
+        assert entry.state == cm.STATE_ANSWERED
+        assert entry.response == "B"
+        assert entry.event.is_set()
+
+    def test_terminal_answer_rejects_timeout_regression(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("id7-cas", "sk7-cas", "Q?", ["A", "B"])
+        _confirm(cm, "id7-cas")
+        assert cm.resolve_gateway_clarify("id7-cas", "A") is True
+
+        assert cm._persist_transition(
+            "id7-cas",
+            expected_states=set(cm._RECOVERABLE_STATES),
+            state=cm.STATE_TIMED_OUT,
+        ) is False
+        with cm._connect() as conn:
+            row = conn.execute(
+                "SELECT state, response FROM clarify_obligations WHERE clarify_id=?",
+                ("id7-cas",),
+            ).fetchone()
+        assert row["state"] == cm.STATE_ANSWERED
+        assert row["response"] == "A"
 
 
     def test_notify_register_unregister_clears_pending(self):
@@ -116,8 +186,10 @@ class TestClarifyPrimitive:
         """Entries from different sessions don't leak across get_pending lookups."""
         from tools import clarify_gateway as cm
 
-        cm.register("idA", "alpha", "Q?", None)  # auto-await text
-        cm.register("idB", "beta", "Q?", None)   # auto-await text
+        cm.register("idA", "alpha", "Q?", None)
+        cm.register("idB", "beta", "Q?", None)
+        _confirm(cm, "idA", "open_text")
+        _confirm(cm, "idB", "open_text")
 
         a = cm.get_pending_for_session("alpha")
         b = cm.get_pending_for_session("beta")
@@ -148,8 +220,10 @@ class TestGatewayTextIntercept:
 
         # Older multi-choice (not awaiting text)
         cm.register("first", "sk", "Q1?", ["A"])
+        _confirm(cm, "first")
         # Newer open-ended (awaiting text)
         cm.register("second", "sk", "Q2?", None)
+        _confirm(cm, "second", "open_text")
 
         pending = cm.get_pending_for_session("sk")
         # The newer one is awaiting text; the older isn't.
@@ -171,9 +245,8 @@ class TestGatewayTextIntercept:
         # Initially, multi-choice does NOT await text (button path)
         assert entry.awaiting_text is False
 
-        # After the base send_clarify text fallback calls mark_awaiting_text:
-        flipped = cm.mark_awaiting_text("id-tf")
-        assert flipped is True
+        # The base text fallback confirms a numbered-text delivery.
+        _confirm(cm, "id-tf", "numbered_text")
 
         # Now get_pending_for_session should find it
         pending = cm.get_pending_for_session("sk-tf")
@@ -256,6 +329,7 @@ class TestUnlimitedWait:
         from tools import clarify_gateway as cm
 
         cm.register("u1", "sk", "Q?", ["A", "B"])
+        _confirm(cm, "u1")
         result_box = {}
 
         def waiter():
@@ -290,8 +364,7 @@ class TestMultiSelectTextFallback:
     def _register_multi(self, cid="m1", choices=("A", "B", "C")):
         from tools import clarify_gateway as cm
         entry = cm.register(cid, "sk", "Pick some", list(choices), multi_select=True)
-        # Text fallback path always flips awaiting_text on.
-        cm.mark_awaiting_text(cid)
+        _confirm(cm, cid, "numbered_text")
         return entry
 
     def test_register_stores_multi_select_flag(self):
@@ -341,3 +414,131 @@ class TestMultiSelectTextFallback:
         from tools import clarify_gateway as cm
         entry = cm.register("s4", "sk", "Q?", ["A", "B"])
         assert cm._coerce_text_response(entry, "b") == "B"
+
+
+class TestDurableClarifyRecovery:
+    def setup_method(self):
+        _clear_clarify_state()
+
+    @staticmethod
+    def _durable_state(cm, clarify_id: str) -> str:
+        with cm._connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM clarify_obligations WHERE clarify_id=?",
+                (clarify_id,),
+            ).fetchone()
+        assert row is not None
+        return str(row["state"])
+
+    def test_unconfirmed_prompt_does_not_intercept_unrelated_text(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("preconfirm", "session-a", "Pick", ["A", "B"])
+
+        assert cm.resolve_text_response_for_session("session-a", "A") is False
+        assert cm.resolve_text_response_for_session("different-session", "A") is False
+
+    def test_valid_vote_resolves_after_delivery_confirmation(self):
+        from tools import clarify_gateway as cm
+
+        entry = cm.register("vote", "session-vote", "Pick", ["A", "B"])
+        assert cm.mark_transport_accepted("vote", "poll-guid") is True
+        _confirm(cm, "vote")
+
+        assert cm.resolve_text_response_for_session("session-vote", "B") is True
+        assert entry.response == "B"
+        assert self._durable_state(cm, "vote") == cm.STATE_ANSWERED
+
+    def test_confirmed_prompt_is_recovered_after_restart(self):
+        from tools import clarify_gateway as cm
+
+        cm.register(
+            "recover-confirmed",
+            "session-r",
+            "Pick",
+            ["A", "B"],
+            platform="photon",
+            chat_id="chat-r",
+        )
+        _confirm(cm, "recover-confirmed")
+        _clear_clarify_state()
+
+        recovered = cm.recover_pending(force=True)
+
+        assert [entry.clarify_id for entry in recovered] == ["recover-confirmed"]
+        assert recovered[0].recovered is True
+        assert cm.get_pending_for_session(
+            "session-r", include_choice_prompts=True
+        ) is recovered[0]
+
+    def test_recovered_process_local_buttons_get_one_numbered_fallback(self):
+        from tools import clarify_gateway as cm
+
+        cm.register(
+            "recover-buttons",
+            "session-buttons",
+            "Pick",
+            ["A", "B"],
+            platform="telegram",
+            chat_id="chat-buttons",
+        )
+        _confirm(cm, "recover-buttons", "adapter")
+        _clear_clarify_state()
+
+        entry = cm.recover_pending(force=True)[0]
+
+        assert entry.needs_recovery_fallback is True
+        assert cm.claim_text_fallback(entry.clarify_id) is True
+        assert cm.mark_delivery_confirmed(entry.clarify_id, "numbered_text") is True
+        assert entry.awaiting_text is True
+        assert entry.needs_recovery_fallback is False
+
+    def test_recovered_photon_poll_remains_correlated_without_resend(self):
+        from tools import clarify_gateway as cm
+
+        cm.register(
+            "recover-photon",
+            "session-photon",
+            "Pick",
+            ["A", "B"],
+            platform="photon",
+            chat_id="chat-photon",
+        )
+        assert cm.mark_transport_accepted("recover-photon", "poll-photon") is True
+        _confirm(cm, "recover-photon", "native_poll")
+        _clear_clarify_state()
+
+        entry = cm.recover_pending(force=True)[0]
+
+        assert entry.needs_recovery_fallback is False
+        assert cm.get_pending_for_poll(
+            platform="photon",
+            chat_id="chat-photon",
+            poll_guid="poll-photon",
+        ) is entry
+
+    def test_expired_prompt_is_timed_out_instead_of_recovered(self):
+        from tools import clarify_gateway as cm
+
+        cm.register(
+            "expired",
+            "session-expired",
+            "Still needed?",
+            None,
+            expires_at=time.time() - 1,
+        )
+        _clear_clarify_state()
+
+        assert cm.recover_pending(force=True) == []
+        assert self._durable_state(cm, "expired") == cm.STATE_TIMED_OUT
+
+    def test_ambiguous_fallback_restart_fails_without_duplicate_retry(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("ambiguous", "session-f", "Pick", ["A", "B"])
+        assert cm.mark_transport_accepted("ambiguous", "poll-guid") is True
+        assert cm.claim_text_fallback("ambiguous") is True
+        _clear_clarify_state()
+
+        assert cm.recover_pending(force=True) == []
+        assert self._durable_state(cm, "ambiguous") == cm.STATE_FAILED
