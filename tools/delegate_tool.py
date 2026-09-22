@@ -16,6 +16,7 @@ import time
 import weakref
 from typing import Any, Dict, List, Optional
 
+from agent.run_budget import child_budget_kwargs
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb  # noqa: F401  (used via _ChildRun.await_child)
 from utils import is_truthy_value
 
@@ -234,6 +235,10 @@ def _build_child_agent(
                 session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent
+                # ...but NOT a fresh run ceiling: a child inherits what is left of the
+                # parent's time/cost budget, so a fan-out cannot outrun the run that
+                # spawned it (the parent only sees the child's cost once it folds back in).
+                **child_budget_kwargs(parent_agent),
             )
         except BaseException:
             # No child close() will ever run: release the dedicated handle here.

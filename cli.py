@@ -2545,6 +2545,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
         base_url: str = None,
         max_turns: int = None,
         run_budget: float = None,
+        run_budget_usd: float = None,
         verbose: Optional[bool] = None,
         compact: bool = False,
         resume: str = None,
@@ -2555,7 +2556,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
         """CLI args win over config; ``reasoning`` is per-run only; ``resume`` restores history from SQLite."""
         self._init_display_options(verbose, compact)
         self._init_model_routing(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
-                                 checkpoints, pass_session_id, ignore_rules)
+                                 run_budget_usd, checkpoints, pass_session_id, ignore_rules)
         self._init_runtime_state(resume)
 
     def _init_display_options(self, verbose, compact):
@@ -2626,10 +2627,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
         self._last_input_mode_recovery = self._last_termios_drift_check = 0.0
         self._input_mode_recovery_notice_shown = self._termios_drift_notice_shown = False
 
-    def _init_model_routing(self, model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, checkpoints, pass_session_id, ignore_rules):
+    def _init_model_routing(self, model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, run_budget_usd, checkpoints, pass_session_id, ignore_rules):
         """Resolve model/provider/base_url, turn limits, toolsets, checkpoints, prompt/personality, reasoning + routing config."""
         self._init_model_and_provider(model, provider, api_key, base_url)
-        self._init_turn_limits(max_turns, run_budget)
+        self._init_turn_limits(max_turns, run_budget, run_budget_usd)
         self._init_toolsets(toolsets)
         self._init_checkpoints_and_rules(checkpoints, pass_session_id, ignore_rules)
         self._init_prompt_and_reasoning(reasoning)
@@ -2724,8 +2725,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
             _keys = _keys[::-1]
         self.api_key = api_key or os.getenv(_keys[0]) or os.getenv(_keys[1])
 
-    def _init_turn_limits(self, max_turns, run_budget):
-        """max_turns: CLI arg > config > env var > default; run budget: CLI flag > config."""
+    def _init_turn_limits(self, max_turns, run_budget, run_budget_usd=None):
+        """max_turns: CLI arg > config > env var > default; run budgets: CLI flag > config."""
         # resolve_turn_limit() accepts "none"/"unlimited" (-> sys.maxsize) alongside ints.
         # KEEP the root-level CLI_CONFIG["max_turns"] fallback: it is never migrated on disk
         # and other config paths may bypass the load-time fold.
@@ -2735,6 +2736,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
             os.getenv("HERMES_MAX_ITERATIONS"),
         ))
         self.run_budget_seconds = run_budget if run_budget is not None else CLI_CONFIG["agent"].get("run_budget_seconds")
+        self.run_budget_usd = (
+            run_budget_usd if run_budget_usd is not None else CLI_CONFIG["agent"].get("run_budget_usd")
+        )
 
     def _init_toolsets(self, toolsets):
         self.enabled_toolsets = toolsets
@@ -4260,7 +4264,7 @@ def _install_single_query_signal_handlers(cli):
                 _signal.signal(getattr(_signal, _name), _signal_handler_q)
 
 
-def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills):
+def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, run_budget_usd, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills):
     """Resolve the toolset list (explicit / coding posture / platform default), construct HermesCLI, and start the background skills preload."""
     toolsets_list = None
     if isinstance(toolsets, str) and toolsets:
@@ -4293,6 +4297,7 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
             base_url=base_url,
             max_turns=max_turns,
             run_budget=run_budget,
+            run_budget_usd=run_budget_usd,
             verbose=verbose,
             compact=compact,
             resume=resume,
@@ -4475,6 +4480,7 @@ def main(
     base_url: str = None,
     max_turns: int = None,
     run_budget: float = None,
+    run_budget_usd: float = None,
     verbose: Optional[bool] = None,
     quiet: bool = False,
     compact: bool = False,
@@ -4545,7 +4551,8 @@ def main(
     _join_worktree = _start_worktree_setup(list_tools, list_toolsets, worktree, w)
     query = query or q
     cli = _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
-                               verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills)
+                               run_budget_usd, verbose, compact, resume, checkpoints, pass_session_id,
+                               ignore_rules, skills)
 
     # Join the background worktree creation before anything consumes TERMINAL_CWD.
     # A requested worktree whose setup failed aborts: never silently run without isolation.

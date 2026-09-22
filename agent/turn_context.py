@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 import sys
 import threading
-import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
@@ -23,6 +22,7 @@ from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
+from agent.run_budget import stamp_run
 from agent.image_token_cost import bind_image_token_cost
 from agent.usage_anchor import anchored_context_tokens, restore_usage_anchor
 
@@ -472,10 +472,9 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
         agent._compression_warning = None  # send once
 
     agent.iteration_budget = IterationBudget(agent.max_iterations)
-    # Wall-clock run budget: stamped only when configured (one wrap-up notice per run).
-    agent._run_budget_started_at = (
-        time.time() if getattr(agent, "run_budget_seconds", None) else None
-    )
+    # Per-run ceilings (wall-clock / spend): stamped only when configured, so an unset
+    # budget stays dormant. One wrap-up notice per run, then a hard stop at the ceiling.
+    stamp_run(agent)
     # Reset the streaming context / think scrubbers at the top of each turn.
     for name in ("_stream_context_scrubber", "_stream_think_scrubber"):
         scrubber = getattr(agent, name, None)

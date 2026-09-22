@@ -1706,6 +1706,7 @@ def cmd_chat(args):
         "query": args.query,
         "oneshot": bool(getattr(args, "oneshot_exit", False)),
         "run_budget": getattr(args, "run_budget", None),
+        "run_budget_usd": getattr(args, "run_budget_usd", None),
         "ignore_rules": getattr(args, "ignore_rules", False) or safe_mode,
         "ignore_user_config": getattr(args, "ignore_user_config", False) or safe_mode,
         "compact": getattr(args, "compact", False),

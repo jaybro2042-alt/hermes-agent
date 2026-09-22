@@ -1093,6 +1093,13 @@ agent:
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 500
 
+  # Per-run ceilings for unattended work (null / unset = off). At 80% of either
+  # the model gets a one-time wrap-up notice; at 100% the run stops before the
+  # next provider call. Subagents inherit whatever is left.
+  # CLI: `hermes chat --run-budget 850 --run-budget-usd 5`
+  # run_budget_seconds: 850     # wall-clock ceiling per run, seconds
+  # run_budget_usd: 5           # estimated-spend ceiling per run, USD
+
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
   # API responses.  Only fires after the agent has been idle for this duration.

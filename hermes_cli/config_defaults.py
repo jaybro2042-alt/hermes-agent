@@ -51,9 +51,13 @@ DEFAULT_CONFIG = {
         # caps; "none"/"unlimited"/"inf"/0/-1 also mean unlimited (resolve_turn_limit).
         "max_turns": None,
         # Wall-clock budget (seconds) per run. null = off. When set: one-time wrap-up notice at 80%
-        # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
-        # `hermes chat --run-budget N`.
+        # elapsed; implicit provider stale timeouts capped to remaining budget; the run stops
+        # before the next provider call at 100%. CLI equivalent: `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # Estimated-spend budget (USD) per run. null = off. Same wrap-up notice at 80% and hard
+        # stop at 100%, measured on this run's estimated cost; unpriced routes never move it.
+        # Subagents inherit the remainder. CLI equivalent: `hermes chat --run-budget-usd N`.
+        "run_budget_usd": None,
         # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle — not
         # while calling tools or receiving API responses. 0 = unlimited.
         "gateway_timeout": 1800,
