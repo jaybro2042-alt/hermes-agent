@@ -1122,27 +1122,35 @@ agent:
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
 
-## Wall-Clock Run Budget
+## Run Budgets (Time and Spend)
 
-Separate from the iteration budget, you can give each conversation run an optional **wall-clock** budget. This is designed for one-shot and eval-harness invocations that run under a hard external ceiling (e.g. a 900-second per-task limit): without it, a run can time out with the work essentially done — one generation short of emitting the final answer, or stuck in a single hung provider call.
+Separate from the iteration budget, you can give each conversation run an optional **wall-clock** budget and an optional **estimated-spend** budget. Both are designed for unattended runs — one-shot invocations, eval harnesses, kanban workers, cron jobs — where nobody is watching a long agent loop: without a ceiling, a single turn can run for hours and bill for every iteration it takes to get there.
 
 ```yaml
 agent:
-  run_budget_seconds: null     # Optional; unset/null = feature fully off (default)
+  run_budget_seconds: null     # Optional wall-clock ceiling, seconds; null = off (default)
+  run_budget_usd: null         # Optional estimated-spend ceiling, USD; null = off (default)
 ```
 
 Or per-invocation via the CLI:
 
 ```bash
-hermes chat --run-budget 850 -q "..."
+hermes chat --run-budget 850 --run-budget-usd 5 -q "..."
 ```
 
-When a budget is set, two things happen:
+When a budget is set, three things happen:
 
-1. **Wrap-up notice at 80%.** When 80% of the budget has elapsed, Hermes injects a **one-time** notice (delivered cache-safely, appended to the newest tool result like `/steer` messages) telling the model to stop new discovery/verification work and produce the final deliverable from the state it already has. It fires at most once per run and mirrors the existing iteration-budget wrap-up mechanism — there are no repeated pressure warnings.
-2. **Deadline-scaled stale timeouts.** Implicit non-streaming stale timeouts (the 90s default and the reasoning-model floors, e.g. 600s for DeepSeek reasoning models) are capped at `max(60, remaining_budget × 0.5)` so a single silently-hung provider call can never consume the rest of the run. The cap only ever *tightens* the timeout — it never raises it — and an explicitly configured `stale_timeout_seconds` (provider/model config or `HERMES_API_CALL_STALE_TIMEOUT`) always wins untouched.
+1. **Wrap-up notice at 80%.** When the run has used 80% of either ceiling, Hermes injects a **one-time** notice (delivered cache-safely, appended to the newest tool result like `/steer` messages) telling the model to stop new discovery/verification work and produce the final deliverable from the state it already has. It fires at most once per run and mirrors the existing iteration-budget wrap-up mechanism — there are no repeated pressure warnings.
+2. **Hard stop at 100%.** Once elapsed time or run spend crosses its ceiling, the turn ends **before the next provider call** — no summary request is made, because a ceiling that bills one more call to announce itself is not a ceiling. The check runs between iterations, never mid-request, so the request that crossed the line still completes and its transcript and usage are recorded. Whatever the model has already produced is returned, and `continue` resumes with a fresh budget.
+3. **Deadline-scaled stale timeouts.** Implicit non-streaming stale timeouts (the 90s default and the reasoning-model floors, e.g. 600s for DeepSeek reasoning models) are capped at `max(60, remaining_budget × 0.5)` so a single silently-hung provider call can never consume the rest of the run. The cap only ever *tightens* the timeout — it never raises it — and an explicitly configured `stale_timeout_seconds` (provider/model config or `HERMES_API_CALL_STALE_TIMEOUT`) always wins untouched.
 
-The budget is per `run_conversation` turn (it resets on each user message) and the feature is completely dormant when unset — no clock reads, no injection, no timeout changes.
+Budgets are per `run_conversation` turn (they reset on each user message) and the feature is completely dormant when unset — no clock reads, no cost reads, no injection, no timeout changes.
+
+`run_budget_usd` is measured against Hermes's own **estimated** cost for the run, the same figure session accounting and the token/cost dashboard use. Routes with no pricing data (subscription or included providers, unknown models) never move the counter, so the ceiling stays dormant rather than guessing at a number.
+
+**Subagents inherit the remainder.** A delegated child is constructed with what is *left* of the parent's time and spend ceilings, so a fan-out cannot outrun the run that spawned it. Children running in parallel each get the same remainder — the bound is per child, not a shared pool — and the parent stops at its own next iteration once their cost folds back into the run.
+
+Together with `agent.max_turns` (the per-turn iteration cap, unlimited by default) these are the three ceilings on an unattended run: calls, time, and spend. Setting all three is the recommended posture for any Hermes that runs without someone watching it.
 
 ## Verify-on-Stop (coding verification)
 

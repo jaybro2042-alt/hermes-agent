@@ -308,13 +308,9 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
 
 def _normalize_run_budget_seconds(value) -> Optional[float]:
     """Positive float or None (feature off). ``bool`` rejected: YAML ``true`` → 1s budget."""
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        seconds = float(value)
-    except (TypeError, ValueError):
-        return None
-    return seconds if seconds > 0 else None  # NaN compares False → None
+    from agent.run_budget import normalize_budget
+
+    return normalize_budget(value)
 
 
 def _refuse_checkpoint_required_on_codex_app_server(
@@ -541,6 +537,7 @@ _TURN_STATE: Dict[str, Any] = {
     "_budget_exhausted_injected": False,
     "_budget_grace_call": False,
     "_run_budget_started_at": None,  # set by turn_context.prepare_turn when a budget is active
+    "_run_budget_cost_at_start": None,  # spend baseline for the per-run cost ceiling
     "_run_budget_wrapup_injected": False,  # one-shot latch for the 80% wrap-up notice
     # Activity tracking (API call / tool / stream chunk) for the gateway timeout handler and
     # "still working" notifications. Named provenances are stamped only by compression writers.
@@ -655,11 +652,12 @@ def _init_prompt_cache_config(agent):
             agent._cache_disabled = True
 
 
-def _init_turn_state(agent, run_budget_seconds):
+def _init_turn_state(agent, run_budget_seconds, run_budget_usd):
     _set_defaults(agent, _TURN_STATE)
-    # Wall-clock run budget per turn: constructor arg wins, else agent.run_budget_seconds
-    # (in _apply_agent_section). None = fully off (no clock reads, injection, or capping).
+    # Per-run ceilings: constructor arg wins, else the agent.run_budget_* config keys
+    # (in _apply_agent_section). None = fully off (no clock reads, no cost reads).
     agent.run_budget_seconds = _normalize_run_budget_seconds(run_budget_seconds)
+    agent.run_budget_usd = _normalize_run_budget_seconds(run_budget_usd)
     from agent.credits_tracker import new_credits_latch
     agent._credits_latch = new_credits_latch()  # threshold-notice latch (sticky keys + gates)
 
@@ -1319,11 +1317,13 @@ def _apply_agent_section(agent, _agent_cfg):
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
     agent._execution_guidance = _agent_section.get("execution_guidance", "auto")
 
-    # Wall-clock run budget from config — only when the constructor arg was not given.
+    # Per-run ceilings from config — only when the constructor arg was not given.
     if agent.run_budget_seconds is None:
         agent.run_budget_seconds = _normalize_run_budget_seconds(
             _agent_section.get("run_budget_seconds")
         )
+    if agent.run_budget_usd is None:
+        agent.run_budget_usd = _normalize_run_budget_seconds(_agent_section.get("run_budget_usd"))
 
     # Empty-response guard: a malformed section falls back to schema defaults (on, $0.25).
     from agent.empty_response_guard import resolve_guard_settings
@@ -2216,6 +2216,7 @@ def init_agent(
     load_soul_identity: bool = False, skip_memory: bool = False,
     skip_background_review: bool = False, session_db=None, parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None, run_budget_seconds: Optional[float] = None,
+    run_budget_usd: Optional[float] = None,
     fallback_model: Dict[str, Any] = None, credential_pool=None, checkpoints_enabled: bool = False,
     checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
@@ -2284,7 +2285,7 @@ def init_agent(
     agent._force_ascii_payload = False
 
     _init_prompt_cache_config(agent)
-    _init_turn_state(agent, run_budget_seconds)
+    _init_turn_state(agent, run_budget_seconds, run_budget_usd)
     _setup_logging(agent)
     _set_defaults(agent, _STREAM_STATE)
     _build_client(agent, api_key, base_url, fallback_model)

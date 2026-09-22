@@ -71,9 +71,10 @@ def prepare_iteration(agent: Any,*, messages: Any, api_call_count: Any) -> Itera
     if _pre_api_steer:
         _inject_steer_into_newest_tool_result(agent, messages, _pre_api_steer)
 
-    # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, via the
-    # same cache-safe channel as /steer (newest tool result); off with no budget.
-    if getattr(agent, "run_budget_seconds", None):
+    # One-shot run-budget wrap-up notice at 80% of a run ceiling (agent.run_budget_seconds
+    # or agent.run_budget_usd), via the same cache-safe channel as /steer (newest tool
+    # result); off with no budget.
+    if getattr(agent, "run_budget_seconds", None) or getattr(agent, "run_budget_usd", None):
         _maybe_inject_run_budget_wrapup(agent, messages)
 
     request_logger = getattr(agent, "logger", None) or logger  # same name as the origin module
@@ -223,7 +224,8 @@ def announce_api_call(
 @dataclass
 class IterationStart:
     """``action``: ``"fallthrough"`` (run the iteration) or ``"break"`` (turn ends: interrupt,
-    review input budget or iteration budget exhausted — ``_turn_exit_reason`` set)."""
+    review input budget, run time/cost ceiling or iteration budget exhausted —
+    ``_turn_exit_reason`` set)."""
 
     action: str
     original_user_message: Any
@@ -242,6 +244,7 @@ def begin_iteration(
     from agent.conversation_loop import (
         _apply_active_turn_redirect, _review_input_budget_exhausted
     )
+    from agent.run_budget import check as run_budget_check
 
     def _verdict(action: str) -> IterationStart:
         return IterationStart(
@@ -279,6 +282,19 @@ def begin_iteration(
                 f"({int(agent.session_input_tokens):,} tokens) — stopping "
                 f"the review tool loop before the next provider call."
             )
+        return _verdict("break")
+
+    # Hard run ceilings (wall-clock / spend). Checked here so the crossing request already
+    # completed and its usage landed, and before api_call_count grows — the call being
+    # refused is the NEXT one. No summary request follows: a ceiling that bills one more
+    # call to announce itself is not a ceiling.
+    _breach = run_budget_check(agent)
+    if _breach is not None:
+        _turn_exit_reason = _breach.exit_reason
+        logger.warning("Run budget exhausted (session=%s): %s", agent.session_id or "-", _breach.notice)
+        if not agent.quiet_mode:
+            agent._safe_print(f"\n⏹️  {_breach.notice}")
+        agent._emit_status(f"⏹️ {_breach.notice}")
         return _verdict("break")
 
     api_call_count += 1

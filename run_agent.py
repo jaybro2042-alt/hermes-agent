@@ -265,6 +265,7 @@ class AIAgent(
         skip_memory: bool = False, skip_background_review: bool = False,
         session_db=None, parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None, run_budget_seconds: Optional[float] = None,
+        run_budget_usd: Optional[float] = None,
         fallback_model: Dict[str, Any] = None, credential_pool=None,
         checkpoints_enabled: bool = False, checkpoint_max_snapshots: int = 20,
         checkpoint_max_total_size_mb: int = 500, checkpoint_max_file_size_mb: int = 10,

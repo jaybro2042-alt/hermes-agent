@@ -63,6 +63,11 @@ _EXIT_REASON_PREFIX_EXPLANATIONS = (
         "final answer. Send `continue` to keep going, or raise "
         "`max_iterations`."
     )),
+    ("run_budget_exhausted", (
+        "this run hit its wall-clock or cost ceiling before a final "
+        "answer. Send `continue` to keep going, or raise "
+        "`agent.run_budget_seconds` / `agent.run_budget_usd`."
+    )),
     ("error_near_max_iterations", (
         "an error occurred near the iteration limit before a final "
         "answer. Check the tool output above, then send `continue`."

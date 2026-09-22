@@ -63,9 +63,11 @@ _STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
 
 
-# One-time wrap-up notice appended when a wall-clock run budget (--run-budget) crosses 80%.
+# One-time wrap-up notice appended when a run ceiling (--run-budget / --run-budget-usd)
+# crosses 80%. Deliberately names neither clock nor dollars: the model's job is the same
+# either way, and a single wording keeps the cached prefix identical across both ceilings.
 RUN_BUDGET_WRAPUP_NOTICE = (
-    "[SYSTEM NOTICE — run time budget nearly exhausted] Run time budget nearly exhausted. "
+    "[SYSTEM NOTICE — run budget nearly exhausted] Run budget nearly exhausted. "
     "Stop new discovery/verification work now. Produce the required final deliverable "
     "(answer/JSON/summary) from the state you already have, completing only mandatory writes."
 )
@@ -113,15 +115,14 @@ def _review_input_budget_exhausted(agent: Any) -> bool:
 
 
 def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) -> bool:
-    """Inject the one-time wall-clock wrap-up notice when past 80% of budget.
+    """Inject the one-time wrap-up notice when past 80% of a run ceiling (time or cost).
 
     Appends to the NEWEST ``role:"tool"`` message (cache-safe, like /steer); latches
     ``_run_budget_wrapup_injected`` only on a successful append."""
-    budget = getattr(agent, "run_budget_seconds", None)
-    started = getattr(agent, "_run_budget_started_at", None)
-    if not budget or not started or getattr(agent, "_run_budget_wrapup_injected", False) or (
-        (time.time() - started) < 0.8 * float(budget)
-    ):
+    from agent.run_budget import WRAPUP_FRACTION, used_fraction
+
+    fraction = used_fraction(agent)
+    if getattr(agent, "_run_budget_wrapup_injected", False) or fraction < WRAPUP_FRACTION:
         return False
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") == "tool":
@@ -134,10 +135,7 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
                 except Exception:
                     return False
             agent._run_budget_wrapup_injected = True
-            logger.info(
-                "Run budget wrap-up notice injected (budget=%.0fs, elapsed=%.0fs)",
-                float(budget), time.time() - started,
-            )
+            logger.info("Run budget wrap-up notice injected (%.0f%% of ceiling used)", fraction * 100)
             return True
     return False
 

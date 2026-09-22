@@ -518,6 +518,7 @@ class CLIAgentSetupMixin:
                 acp_args=runtime.get("args"), credential_pool=runtime.get("credential_pool"),
                 max_tokens=self.max_tokens, max_iterations=self.max_turns,
                 run_budget_seconds=getattr(self, "run_budget_seconds", None),
+                run_budget_usd=getattr(self, "run_budget_usd", None),
                 enabled_toolsets=self.enabled_toolsets, disabled_toolsets=self.disabled_toolsets,
                 verbose_logging=self.verbose, quiet_mode=not self.verbose,
                 tool_progress_mode=getattr(self, "tool_progress_mode", "all"),

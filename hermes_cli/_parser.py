@@ -254,6 +254,12 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
         "budget so one hung call can't consume the run. Unset = off. "
         "Also configurable as agent.run_budget_seconds in config.yaml. "
         "Intended for one-shot/eval invocations with a hard ceiling."))
+    add("--run-budget-usd", type=float, default=None, metavar="USD", dest="run_budget_usd", help=(
+        "Optional estimated-spend budget in USD for each conversation run. "
+        "At 80%% spent the agent gets the same one-time wrap-up notice, and "
+        "at 100%% the run stops before the next provider call. Subagents "
+        "inherit what is left. Unset = off. Also configurable as "
+        "agent.run_budget_usd in config.yaml."))
     inherited(chat_parser, "--yolo", action="store_true", default=SUPPRESS,
               help="Bypass all dangerous command approval prompts (use at your own risk)")
     inherited(chat_parser, "--pass-session-id", action="store_true", default=SUPPRESS,
