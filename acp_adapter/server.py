@@ -72,7 +72,12 @@ from acp_adapter.events import (
 )
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
-from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
+from acp_adapter.session import (
+    ProviderResolutionError,
+    SessionManager,
+    SessionState,
+    _expand_acp_enabled_toolsets,
+)
 from acp_adapter.tools import build_tool_complete, build_tool_start
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
@@ -2197,13 +2202,17 @@ class HermesACPAgent(acp.Agent):
         current_provider = getattr(state.agent, "provider", None) or "openrouter"
         target_provider, new_model = self._resolve_model_selection(args, current_provider)
 
+        try:
+            new_agent = self.session_manager._make_agent(
+                session_id=state.session_id,
+                cwd=state.cwd,
+                model=new_model,
+                requested_provider=target_provider,
+            )
+        except ProviderResolutionError as exc:
+            return f"Model switch failed (session unchanged): {exc}"
+        state.agent = new_agent
         state.model = new_model
-        state.agent = self.session_manager._make_agent(
-            session_id=state.session_id,
-            cwd=state.cwd,
-            model=new_model,
-            requested_provider=target_provider,
-        )
         self.session_manager.save_session(state.session_id)
         provider_label = getattr(state.agent, "provider", None) or target_provider or current_provider
         logger.info("Session %s: model switched to %s", state.session_id, new_model)
@@ -2444,18 +2453,40 @@ class HermesACPAgent(acp.Agent):
                 model_id,
                 current_provider or "openrouter",
             )
-            state.model = resolved_model
             provider_changed = bool(current_provider and requested_provider != current_provider)
             current_base_url = None if provider_changed else getattr(state.agent, "base_url", None)
             current_api_mode = None if provider_changed else getattr(state.agent, "api_mode", None)
-            state.agent = self.session_manager._make_agent(
-                session_id=session_id,
-                cwd=state.cwd,
-                model=resolved_model,
-                requested_provider=requested_provider,
-                base_url=current_base_url,
-                api_mode=current_api_mode,
-            )
+            # Build the replacement first: if the requested provider cannot be
+            # resolved this raises and the session keeps its current model and
+            # agent (no silent fallback, no half-applied switch).
+            try:
+                new_agent = self.session_manager._make_agent(
+                    session_id=session_id,
+                    cwd=state.cwd,
+                    model=resolved_model,
+                    requested_provider=requested_provider,
+                    base_url=current_base_url,
+                    api_mode=current_api_mode,
+                )
+            except ProviderResolutionError as exc:
+                logger.error(
+                    "Session %s: model switch to %s via provider %s failed; session unchanged: %s",
+                    session_id,
+                    resolved_model,
+                    requested_provider,
+                    exc,
+                )
+                raise acp.RequestError(
+                    -32603,
+                    f"Model switch failed: {exc}",
+                    {
+                        "reason": "provider_resolution_failed",
+                        "provider": requested_provider,
+                        "model": resolved_model,
+                    },
+                ) from exc
+            state.agent = new_agent
+            state.model = resolved_model
             self.session_manager.save_session(session_id)
             logger.info(
                 "Session %s: model switched to %s via provider %s",

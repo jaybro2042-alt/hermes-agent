@@ -172,6 +172,11 @@ class SessionState:
     interrupted_prompt_text: str = ""
 
 
+
+class ProviderResolutionError(RuntimeError):
+    """An explicitly requested provider could not be resolved (no fallback used)."""
+
+
 class SessionManager:
     """Thread-safe manager for ACP sessions backed by Hermes AIAgent instances.
 
@@ -568,6 +573,7 @@ class SessionManager:
                 requested_provider=requested_provider,
                 base_url=restored_base_url,
                 api_mode=restored_api_mode,
+                strict_provider=False,
             )
         except Exception:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
@@ -609,7 +615,20 @@ class SessionManager:
         requested_provider: str | None = None,
         base_url: str | None = None,
         api_mode: str | None = None,
+        strict_provider: bool | None = None,
     ):
+        """Build an AIAgent for an ACP session.
+
+        When ``requested_provider`` is given explicitly (a model/provider
+        switch), a failure to resolve that provider raises
+        :class:`ProviderResolutionError` instead of silently falling back to
+        the default client: falling back sends the request to a different
+        endpoint than the one the caller asked for.  ``strict_provider=False``
+        keeps the legacy lenient fallback (used when restoring persisted
+        sessions).
+        """
+        if strict_provider is None:
+            strict_provider = bool(requested_provider)
         if self._agent_factory is not None:
             return self._agent_factory()
 
@@ -657,7 +676,19 @@ class SessionManager:
                     "args": list(runtime.get("args") or []),
                 }
             )
-        except Exception:
+        except Exception as exc:
+            if strict_provider:
+                logger.warning(
+                    "ACP session %s: explicitly requested provider %r could not be resolved: %s",
+                    session_id,
+                    requested_provider,
+                    exc,
+                )
+                raise ProviderResolutionError(
+                    f"Provider {requested_provider!r} could not be resolved for model "
+                    f"{model or default_model!r}: {exc}. No fallback provider was used; "
+                    "fix the provider credentials/configuration and retry."
+                ) from exc
             logger.debug("ACP session falling back to default provider resolution", exc_info=True)
 
         _register_task_cwd(session_id, cwd)

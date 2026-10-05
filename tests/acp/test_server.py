@@ -689,3 +689,69 @@ class TestRegisterSessionMcpServers:
         with patch("tools.mcp_tool.register_mcp_servers", side_effect=RuntimeError("boom")):
             # Should not raise
             await agent._register_session_mcp_servers(state, [server])
+
+
+# ---------------------------------------------------------------------------
+# Model switch must not half-apply when the provider cannot be resolved
+# ---------------------------------------------------------------------------
+
+
+class TestModelSwitchProviderFailure:
+
+    @pytest.mark.asyncio
+    async def test_set_session_model_failure_raises_and_keeps_state(self, agent):
+        from acp_adapter.session import ProviderResolutionError
+
+        resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(resp.session_id)
+        state.model = "google-opus-5.5"
+        original_agent = state.agent
+        original_agent.provider = "custom"
+
+        def boom(**kwargs):
+            raise ProviderResolutionError("Provider 'vertex' could not be resolved")
+
+        with patch.object(agent.session_manager, "_make_agent", side_effect=boom), \
+                patch.object(agent.session_manager, "save_session") as save:
+            with pytest.raises(acp.RequestError) as excinfo:
+                await agent.set_session_model(
+                    "vertex:google/gemini-3.8-flash", resp.session_id
+                )
+
+        assert "Model switch failed" in str(excinfo.value)
+        assert excinfo.value.data["reason"] == "provider_resolution_failed"
+        assert state.model == "google-opus-5.5"
+        assert state.agent is original_agent
+        save.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_set_session_model_success_updates_after_replacement(self, agent):
+        resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(resp.session_id)
+        state.agent.provider = "custom"
+        replacement = MagicMock(name="VertexAgent")
+        replacement.provider = "vertex"
+
+        with patch.object(agent.session_manager, "_make_agent", return_value=replacement):
+            await agent.set_session_model("vertex:google/gemini-3.8-flash", resp.session_id)
+
+        assert state.agent is replacement
+        assert state.model == "google/gemini-3.8-flash"
+
+    def test_slash_model_failure_reports_and_keeps_state(self, agent):
+        from acp_adapter.session import ProviderResolutionError, SessionState
+
+        original = MagicMock(name="Original")
+        original.provider = "custom"
+        state = SessionState(session_id="x", agent=original, cwd="/tmp", model="google-opus-5.5")
+
+        with patch.object(
+            agent.session_manager,
+            "_make_agent",
+            side_effect=ProviderResolutionError("Provider 'vertex' could not be resolved"),
+        ):
+            out = agent._cmd_model("vertex:google/gemini-3.8-flash", state)
+
+        assert out.startswith("Model switch failed (session unchanged)")
+        assert state.agent is original
+        assert state.model == "google-opus-5.5"

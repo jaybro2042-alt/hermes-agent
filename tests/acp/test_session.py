@@ -345,3 +345,104 @@ class TestPersistence:
 
         assert stdout_buf.getvalue() == ""
         assert stderr_buf.getvalue() == "ACP noise\n"
+
+
+# ---------------------------------------------------------------------------
+# Explicit provider resolution must fail closed (no silent fallback)
+# ---------------------------------------------------------------------------
+
+
+class TestExplicitProviderResolution:
+    VERTEX_URL = (
+        "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/global/endpoints/openapi"
+    )
+
+    def _patch_common(self, monkeypatch, built):
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                built.append(kwargs)
+                self.kwargs = kwargs
+                self.model = kwargs.get("model")
+                self.provider = kwargs.get("provider")
+                self.base_url = kwargs.get("base_url")
+
+        cfg = {
+            "model": {"default": "google-opus-5.5", "provider": "custom"},
+            "mcp_servers": {},
+        }
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
+
+    def test_injected_vertex_resolution_failure_raises_without_fallback(self, monkeypatch):
+        from acp_adapter.session import ProviderResolutionError
+
+        built = []
+        self._patch_common(monkeypatch, built)
+        calls = []
+
+        def failing_resolve(requested=None, **kwargs):
+            calls.append(requested)
+            raise RuntimeError("Reauthentication failed (injected ADC failure)")
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider", failing_resolve
+        )
+
+        with pytest.raises(ProviderResolutionError) as excinfo:
+            SessionManager(db=None)._make_agent(
+                session_id="s1",
+                cwd="/tmp",
+                model="google/gemini-3.8-flash",
+                requested_provider="vertex",
+            )
+
+        assert calls == ["vertex"]
+        assert built == []  # no fallback client / agent was created
+        assert "vertex" in str(excinfo.value)
+        assert "No fallback provider was used" in str(excinfo.value)
+
+    def test_successful_explicit_vertex_keeps_vertex_endpoint(self, monkeypatch):
+        built = []
+        self._patch_common(monkeypatch, built)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None, **kw: {
+                "provider": requested,
+                "api_mode": "chat_completions",
+                "base_url": self.VERTEX_URL,
+                "api_key": "test-token",
+            },
+        )
+
+        agent = SessionManager(db=None)._make_agent(
+            session_id="s2",
+            cwd="/tmp",
+            model="google/gemini-3.8-flash",
+            requested_provider="vertex",
+        )
+
+        assert agent.provider == "vertex"
+        assert agent.base_url == self.VERTEX_URL
+        assert "127.0.0.1:4001" not in (agent.base_url or "")
+
+    def test_lenient_mode_keeps_legacy_fallback_for_restores(self, monkeypatch):
+        built = []
+        self._patch_common(monkeypatch, built)
+
+        def failing_resolve(requested=None, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider", failing_resolve
+        )
+
+        agent = SessionManager(db=None)._make_agent(
+            session_id="s3",
+            cwd="/tmp",
+            model="m",
+            requested_provider="vertex",
+            strict_provider=False,
+        )
+        assert len(built) == 1
+        assert "provider" not in agent.kwargs
